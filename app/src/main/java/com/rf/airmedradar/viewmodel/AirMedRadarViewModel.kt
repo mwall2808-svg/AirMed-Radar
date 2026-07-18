@@ -10,20 +10,29 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.google.android.gms.maps.model.LatLng
+import com.google.android.libraries.places.api.Places
+import com.google.android.libraries.places.api.model.AutocompletePrediction
+import com.google.android.libraries.places.api.model.AutocompleteSessionToken
 import com.rf.airmedradar.data.Aircraft
+import com.rf.airmedradar.data.PlacesAutocompleteRepository
 import com.rf.airmedradar.service.AirMedTrackingService
 import com.rf.airmedradar.service.InterceptStatus
 import com.rf.airmedradar.service.SimulationStatus
 import com.rf.airmedradar.service.TrackingSnapshot
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.launch
 
 /**
  * Thin UI-facing façade over [AirMedTrackingService]: starts the always-running telemetry
@@ -50,6 +59,7 @@ class AirMedRadarViewModel(application: Application) : AndroidViewModel(applicat
         val serviceIntent = Intent(context, AirMedTrackingService::class.java)
         ContextCompat.startForegroundService(context, serviceIntent)
         context.bindService(serviceIntent, connection, Context.BIND_AUTO_CREATE)
+        observeSearchQuery()
     }
 
     @OptIn(ExperimentalCoroutinesApi::class)
@@ -80,6 +90,19 @@ class AirMedRadarViewModel(application: Application) : AndroidViewModel(applicat
     private val _lzFocusRequestId = MutableStateFlow(0L)
     val lzFocusRequestId: StateFlow<Long> = _lzFocusRequestId.asStateFlow()
 
+    // --- Places predictive autocomplete (purely UI-facing; the background engine doesn't
+    // need to know about in-progress typing, only the final resolved target). ---
+
+    private val placesClient = runCatching { Places.createClient(getApplication()) }.getOrNull()
+    private val placesRepository = placesClient?.let { PlacesAutocompleteRepository(it) }
+    private var sessionToken = AutocompleteSessionToken.newInstance()
+
+    private val _searchQuery = MutableStateFlow("")
+    val searchQuery: StateFlow<String> = _searchQuery.asStateFlow()
+
+    private val _addressSuggestions = MutableStateFlow<List<AutocompletePrediction>>(emptyList())
+    val addressSuggestions: StateFlow<List<AutocompletePrediction>> = _addressSuggestions.asStateFlow()
+
     fun selectAircraft(aircraft: Aircraft?) {
         _selectedAircraft.value = aircraft
     }
@@ -88,16 +111,53 @@ class AirMedRadarViewModel(application: Application) : AndroidViewModel(applicat
         _lzFocusRequestId.value += 1
     }
 
+    fun onQueryChanged(newQuery: String) {
+        _searchQuery.value = newQuery
+    }
+
+    @OptIn(FlowPreview::class)
+    private fun observeSearchQuery() {
+        viewModelScope.launch {
+            _searchQuery
+                .debounce(250)
+                .distinctUntilChanged()
+                .collectLatest { query ->
+                    _addressSuggestions.value = if (query.isBlank() || placesRepository == null) {
+                        emptyList()
+                    } else {
+                        placesRepository.fetchPredictions(query, sessionToken, OPERATIONAL_CENTER)
+                    }
+                }
+        }
+    }
+
+    /** A dispatcher picked a dropdown suggestion: lock in its full text and geocode it. */
+    fun onSuggestionSelected(prediction: AutocompletePrediction) {
+        val fullText = prediction.getFullText(null).toString()
+        _searchQuery.value = fullText
+        _addressSuggestions.value = emptyList()
+        sessionToken = AutocompleteSessionToken.newInstance() // new billing session for next search
+        searchTarget(fullText)
+    }
+
     fun searchTarget(addressQuery: String) {
+        _addressSuggestions.value = emptyList()
         _boundService.value?.searchTarget(addressQuery)
     }
 
     fun clearTarget() {
         _boundService.value?.clearTarget()
+        _searchQuery.value = ""
+        _addressSuggestions.value = emptyList()
+        sessionToken = AutocompleteSessionToken.newInstance()
     }
 
     override fun onCleared() {
         super.onCleared()
         runCatching { getApplication<Application>().unbindService(connection) }
+    }
+
+    companion object {
+        private val OPERATIONAL_CENTER = LatLng(39.0, -84.9)
     }
 }

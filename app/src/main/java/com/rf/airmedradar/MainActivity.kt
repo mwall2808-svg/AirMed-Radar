@@ -13,6 +13,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -24,9 +25,8 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.widthIn
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.KeyboardActions
-import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.MyLocation
@@ -36,12 +36,12 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.SearchBar
+import androidx.compose.material3.SearchBarDefaults
 import androidx.compose.material3.SheetValue
-import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextField
-import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.material3.rememberBottomSheetScaffoldState
 import androidx.compose.material3.rememberStandardBottomSheetState
 import androidx.compose.runtime.Composable
@@ -51,14 +51,13 @@ import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalSoftwareKeyboardController
-import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -75,6 +74,7 @@ import com.google.maps.android.compose.MapUiSettings
 import com.google.maps.android.compose.Marker
 import com.google.maps.android.compose.rememberCameraPositionState
 import com.google.maps.android.compose.rememberUpdatedMarkerState
+import com.google.android.libraries.places.api.model.AutocompletePrediction
 import com.rf.airmedradar.data.Aircraft
 import com.rf.airmedradar.service.AirMedTrackingService
 import com.rf.airmedradar.service.InterceptStatus
@@ -141,6 +141,8 @@ fun RadarScreen(viewModel: AirMedRadarViewModel, modifier: Modifier = Modifier) 
     val simulationStatus by viewModel.simulationStatus.collectAsStateWithLifecycle()
     val hasLanded by viewModel.hasLanded.collectAsStateWithLifecycle()
     val lzFocusRequestId by viewModel.lzFocusRequestId.collectAsStateWithLifecycle()
+    val searchQuery by viewModel.searchQuery.collectAsStateWithLifecycle()
+    val addressSuggestions by viewModel.addressSuggestions.collectAsStateWithLifecycle()
 
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
@@ -266,8 +268,11 @@ fun RadarScreen(viewModel: AirMedRadarViewModel, modifier: Modifier = Modifier) 
                     modifier = Modifier
                         .align(Alignment.TopCenter)
                         .padding(top = 16.dp, start = 16.dp, end = 16.dp),
-                    hasActiveTarget = targetCoordinate != null,
+                    query = searchQuery,
+                    suggestions = addressSuggestions,
+                    onQueryChange = viewModel::onQueryChanged,
                     onSearch = viewModel::searchTarget,
+                    onSuggestionClick = viewModel::onSuggestionSelected,
                     onClear = viewModel::clearTarget,
                 )
 
@@ -351,62 +356,66 @@ private fun SceneLzMarker(position: LatLng) {
     )
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun TargetSearchBar(
     modifier: Modifier = Modifier,
-    hasActiveTarget: Boolean,
+    query: String,
+    suggestions: List<AutocompletePrediction>,
+    onQueryChange: (String) -> Unit,
     onSearch: (String) -> Unit,
+    onSuggestionClick: (AutocompletePrediction) -> Unit,
     onClear: () -> Unit,
 ) {
-    var query by remember { mutableStateOf("") }
-    val keyboardController = LocalSoftwareKeyboardController.current
+    var expanded by rememberSaveable { mutableStateOf(false) }
 
-    Surface(
+    SearchBar(
         modifier = modifier.widthIn(max = 420.dp),
-        shape = RoundedCornerShape(28.dp),
-        color = MaterialTheme.colorScheme.surface,
-        tonalElevation = 4.dp,
-        shadowElevation = 4.dp,
-    ) {
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
-        ) {
-            Icon(
-                imageVector = Icons.Default.Search,
-                contentDescription = null,
-                tint = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            TextField(
-                value = query,
-                onValueChange = { query = it },
-                modifier = Modifier.weight(1f),
+        inputField = {
+            SearchBarDefaults.InputField(
+                query = query,
+                onQueryChange = onQueryChange,
+                onSearch = {
+                    onSearch(query)
+                    expanded = false
+                },
+                expanded = expanded,
+                onExpandedChange = { expanded = it },
                 placeholder = { Text("Address or intersection…") },
-                singleLine = true,
-                colors = TextFieldDefaults.colors(
-                    unfocusedContainerColor = Color.Transparent,
-                    focusedContainerColor = Color.Transparent,
-                    unfocusedIndicatorColor = Color.Transparent,
-                    focusedIndicatorColor = Color.Transparent,
-                ),
-                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
-                keyboardActions = KeyboardActions(
-                    onSearch = {
-                        onSearch(query)
-                        keyboardController?.hide()
-                    },
-                ),
+                leadingIcon = {
+                    Icon(
+                        imageVector = Icons.Default.Search,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                },
+                trailingIcon = {
+                    if (query.isNotEmpty()) {
+                        IconButton(
+                            onClick = {
+                                onClear()
+                                expanded = false
+                            },
+                        ) {
+                            Icon(Icons.Default.Close, contentDescription = "Clear target")
+                        }
+                    }
+                },
             )
-            if (hasActiveTarget || query.isNotEmpty()) {
-                IconButton(
-                    onClick = {
-                        query = ""
-                        onClear()
-                        keyboardController?.hide()
+        },
+        expanded = expanded,
+        onExpandedChange = { expanded = it },
+    ) {
+        LazyColumn(modifier = Modifier.fillMaxWidth()) {
+            items(suggestions, key = { it.placeId }) { prediction ->
+                ListItem(
+                    headlineContent = { Text(prediction.getPrimaryText(null).toString()) },
+                    supportingContent = { Text(prediction.getSecondaryText(null).toString()) },
+                    modifier = Modifier.clickable {
+                        onSuggestionClick(prediction)
+                        expanded = false
                     },
-                ) {
-                    Icon(Icons.Default.Close, contentDescription = "Clear target")
-                }
+                )
             }
         }
     }

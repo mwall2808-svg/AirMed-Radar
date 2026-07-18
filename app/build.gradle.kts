@@ -63,6 +63,13 @@ dependencies {
     implementation(libs.androidx.lifecycle.viewmodel.compose)
     implementation(libs.androidx.lifecycle.runtime.compose)
     implementation(libs.kotlinx.coroutines.android)
+    implementation(libs.kotlinx.coroutines.play.services)
+    implementation(libs.places) {
+        // Places pulls in a legacy, un-namespaced vectordrawable-animated that collides
+        // with the modern AndroidX artifact already resolved elsewhere. We only use the
+        // Places API surface here, not its UI widgets, so this transitive is safe to drop.
+        exclude(group = "androidx.vectordrawable", module = "vectordrawable-animated")
+    }
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.ktor.client.core)
     implementation(libs.ktor.client.android)
