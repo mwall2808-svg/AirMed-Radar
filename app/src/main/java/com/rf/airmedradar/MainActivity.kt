@@ -2,13 +2,16 @@ package com.rf.airmedradar
 
 import android.Manifest
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.viewModels
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -59,7 +62,6 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import androidx.lifecycle.viewmodel.compose.viewModel
 import com.google.android.gms.maps.CameraUpdateFactory
 import com.google.android.gms.maps.model.BitmapDescriptorFactory
 import com.google.android.gms.maps.model.CameraPosition
@@ -74,10 +76,12 @@ import com.google.maps.android.compose.Marker
 import com.google.maps.android.compose.rememberCameraPositionState
 import com.google.maps.android.compose.rememberUpdatedMarkerState
 import com.rf.airmedradar.data.Aircraft
+import com.rf.airmedradar.service.AirMedTrackingService
+import com.rf.airmedradar.service.InterceptStatus
+import com.rf.airmedradar.service.SimulationStatus
 import com.rf.airmedradar.ui.theme.AirMedRadarTheme
+import com.rf.airmedradar.util.formatEtaSeconds
 import com.rf.airmedradar.viewmodel.AirMedRadarViewModel
-import com.rf.airmedradar.viewmodel.InterceptStatus
-import com.rf.airmedradar.viewmodel.SimulationStatus
 import kotlinx.coroutines.launch
 
 private const val OPERATIONAL_LAT = 39.0
@@ -86,14 +90,29 @@ private const val OPERATIONAL_ZOOM = 9.5f
 private const val CAMERA_ANIMATION_DURATION_MS = 800
 
 class MainActivity : ComponentActivity() {
+
+    private val viewModel: AirMedRadarViewModel by viewModels()
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        handleIntent(intent)
         setContent {
             AirMedRadarTheme {
-                val viewModel: AirMedRadarViewModel = viewModel()
                 RadarScreen(viewModel = viewModel, modifier = Modifier.fillMaxSize())
             }
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleIntent(intent)
+    }
+
+    private fun handleIntent(intent: Intent?) {
+        if (intent?.getBooleanExtra(AirMedTrackingService.EXTRA_FOCUS_LZ, false) == true) {
+            viewModel.requestLzFocus()
         }
     }
 }
@@ -104,6 +123,14 @@ private fun hasLocationPermission(context: Context): Boolean {
     return fine == PackageManager.PERMISSION_GRANTED || coarse == PackageManager.PERMISSION_GRANTED
 }
 
+private fun hasNotificationPermission(context: Context): Boolean {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return true
+    return ContextCompat.checkSelfPermission(
+        context,
+        Manifest.permission.POST_NOTIFICATIONS,
+    ) == PackageManager.PERMISSION_GRANTED
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun RadarScreen(viewModel: AirMedRadarViewModel, modifier: Modifier = Modifier) {
@@ -112,6 +139,8 @@ fun RadarScreen(viewModel: AirMedRadarViewModel, modifier: Modifier = Modifier) 
     val targetCoordinate by viewModel.targetCoordinate.collectAsStateWithLifecycle()
     val interceptStatus by viewModel.interceptStatus.collectAsStateWithLifecycle()
     val simulationStatus by viewModel.simulationStatus.collectAsStateWithLifecycle()
+    val hasLanded by viewModel.hasLanded.collectAsStateWithLifecycle()
+    val lzFocusRequestId by viewModel.lzFocusRequestId.collectAsStateWithLifecycle()
 
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
@@ -123,11 +152,22 @@ fun RadarScreen(viewModel: AirMedRadarViewModel, modifier: Modifier = Modifier) 
     ) { grants ->
         hasLocationPermission = grants.values.any { it }
     }
+
+    var hasNotificationPermission by remember { mutableStateOf(hasNotificationPermission(context)) }
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        hasNotificationPermission = granted
+    }
+
     LaunchedEffect(Unit) {
         if (!hasLocationPermission) {
             locationPermissionLauncher.launch(
                 arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION),
             )
+        }
+        if (!hasNotificationPermission && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
     }
 
@@ -149,8 +189,10 @@ fun RadarScreen(viewModel: AirMedRadarViewModel, modifier: Modifier = Modifier) 
         )
     }
 
-    // Frame both the operational center and the searched target once one is set.
-    LaunchedEffect(targetCoordinate) {
+    // Frame the operational center + target whenever the target changes, or when the user
+    // re-enters the app via the tracking notification (lzFocusRequestId bump) even if the
+    // target coordinate itself hasn't changed since they left.
+    LaunchedEffect(targetCoordinate, lzFocusRequestId) {
         val target = targetCoordinate ?: return@LaunchedEffect
         val bounds = LatLngBounds.Builder()
             .include(operationalCenter)
@@ -190,6 +232,7 @@ fun RadarScreen(viewModel: AirMedRadarViewModel, modifier: Modifier = Modifier) 
                     selectedAircraft = selectedAircraft,
                     interceptStatus = interceptStatus,
                     simulationStatus = simulationStatus,
+                    hasLanded = hasLanded,
                 )
             },
             scaffoldState = scaffoldState,
@@ -376,6 +419,7 @@ private fun StatusSheetContent(
     selectedAircraft: Aircraft?,
     interceptStatus: InterceptStatus?,
     simulationStatus: SimulationStatus?,
+    hasLanded: Boolean,
 ) {
     Column(
         modifier = modifier
@@ -387,10 +431,15 @@ private fun StatusSheetContent(
             style = MaterialTheme.typography.titleMedium,
             color = MaterialTheme.colorScheme.onSurface,
         )
-        if (simulationStatus != null) {
-            Text(
+        when {
+            hasLanded -> Text(
+                text = "AIRCRAFT ON SCENE / LANDED",
+                style = MaterialTheme.typography.labelMedium,
+                color = Color(0xFF00C853),
+            )
+            simulationStatus != null -> Text(
                 text = "MOCK911 inbound — ${"%.1f".format(simulationStatus.distanceNm)} nm • " +
-                    "ETA ${formatEta(simulationStatus.etaSeconds)}",
+                    "ETA ${formatEtaSeconds(simulationStatus.etaSeconds)}",
                 style = MaterialTheme.typography.labelMedium,
                 color = Color(0xFFFFA000),
             )
@@ -452,10 +501,4 @@ private fun InterceptDetailLine(status: InterceptStatus) {
         style = MaterialTheme.typography.bodyLarge,
         color = MaterialTheme.colorScheme.onSurface,
     )
-}
-
-private fun formatEta(totalSeconds: Long): String {
-    val minutes = totalSeconds / 60
-    val seconds = totalSeconds % 60
-    return "%02d:%02d".format(minutes, seconds)
 }
