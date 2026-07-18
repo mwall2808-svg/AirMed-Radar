@@ -4,24 +4,79 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.MyLocation
+import androidx.compose.material.icons.filled.Search
+import androidx.compose.material3.BottomSheetScaffold
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FloatingActionButton
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.SheetValue
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextField
+import androidx.compose.material3.TextFieldDefaults
+import androidx.compose.material3.rememberBottomSheetScaffoldState
+import androidx.compose.material3.rememberStandardBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.google.android.gms.maps.CameraUpdateFactory
 import com.google.android.gms.maps.model.BitmapDescriptorFactory
 import com.google.android.gms.maps.model.CameraPosition
 import com.google.android.gms.maps.model.LatLng
+import com.google.android.gms.maps.model.LatLngBounds
+import com.google.android.gms.maps.model.MapStyleOptions
+import com.google.maps.android.compose.Circle
 import com.google.maps.android.compose.GoogleMap
+import com.google.maps.android.compose.MapProperties
+import com.google.maps.android.compose.MapUiSettings
 import com.google.maps.android.compose.Marker
 import com.google.maps.android.compose.rememberCameraPositionState
 import com.google.maps.android.compose.rememberUpdatedMarkerState
 import com.rf.airmedradar.data.Aircraft
 import com.rf.airmedradar.ui.theme.AirMedRadarTheme
 import com.rf.airmedradar.viewmodel.AirMedRadarViewModel
+import com.rf.airmedradar.viewmodel.InterceptStatus
+import kotlinx.coroutines.launch
+
+private const val OPERATIONAL_LAT = 39.0
+private const val OPERATIONAL_LON = -84.9
+private const val OPERATIONAL_ZOOM = 9.5f
+private const val CAMERA_ANIMATION_DURATION_MS = 800
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -30,37 +85,141 @@ class MainActivity : ComponentActivity() {
         setContent {
             AirMedRadarTheme {
                 val viewModel: AirMedRadarViewModel = viewModel()
-                val aircraft by viewModel.aircraft.collectAsStateWithLifecycle()
-                RadarMap(
-                    aircraft = aircraft,
-                    modifier = Modifier.fillMaxSize(),
-                )
+                RadarScreen(viewModel = viewModel, modifier = Modifier.fillMaxSize())
             }
         }
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun RadarMap(aircraft: List<Aircraft>, modifier: Modifier = Modifier) {
-    // Operational coverage center: Southeastern Indiana / Cincinnati region
-    val operationalCenter = LatLng(39.0, -84.9)
+fun RadarScreen(viewModel: AirMedRadarViewModel, modifier: Modifier = Modifier) {
+    val aircraft by viewModel.aircraft.collectAsStateWithLifecycle()
+    val selectedAircraft by viewModel.selectedAircraft.collectAsStateWithLifecycle()
+    val targetCoordinate by viewModel.targetCoordinate.collectAsStateWithLifecycle()
+    val interceptStatus by viewModel.interceptStatus.collectAsStateWithLifecycle()
+
+    val context = LocalContext.current
+    val coroutineScope = rememberCoroutineScope()
+    val operationalCenter = remember { LatLng(OPERATIONAL_LAT, OPERATIONAL_LON) }
+
     val cameraPositionState = rememberCameraPositionState {
-        position = CameraPosition.fromLatLngZoom(operationalCenter, 9.5f)
+        position = CameraPosition.fromLatLngZoom(operationalCenter, OPERATIONAL_ZOOM)
     }
-    GoogleMap(
-        modifier = modifier,
-        cameraPositionState = cameraPositionState,
-    ) {
-        aircraft.forEach { ac ->
-            key(ac.icao) {
-                AircraftMarker(ac)
+    val mapProperties = remember {
+        MapProperties(mapStyleOptions = MapStyleOptions.loadRawResourceStyle(context, R.raw.map_style_dark))
+    }
+    val mapUiSettings = remember {
+        MapUiSettings(
+            zoomGesturesEnabled = true,
+            scrollGesturesEnabled = true,
+            zoomControlsEnabled = false,
+            myLocationButtonEnabled = false,
+        )
+    }
+
+    // Frame both the operational center and the searched target once one is set.
+    LaunchedEffect(targetCoordinate) {
+        val target = targetCoordinate ?: return@LaunchedEffect
+        val bounds = LatLngBounds.Builder()
+            .include(operationalCenter)
+            .include(target)
+            .build()
+        runCatching {
+            cameraPositionState.animate(
+                CameraUpdateFactory.newLatLngBounds(bounds, 150),
+                CAMERA_ANIMATION_DURATION_MS,
+            )
+        }
+    }
+
+    val scaffoldState = rememberBottomSheetScaffoldState(
+        bottomSheetState = rememberStandardBottomSheetState(initialValue = SheetValue.PartiallyExpanded),
+    )
+    // Expand the sheet to detail view whenever a marker is tapped; collapse when deselected.
+    LaunchedEffect(selectedAircraft) {
+        if (selectedAircraft != null) {
+            scaffoldState.bottomSheetState.expand()
+        } else {
+            scaffoldState.bottomSheetState.partialExpand()
+        }
+    }
+
+    BoxWithConstraints(modifier = modifier) {
+        val peekHeight = maxHeight * 0.08f
+        val expandedHeight = maxHeight * 0.30f
+
+        BottomSheetScaffold(
+            sheetContent = {
+                StatusSheetContent(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(expandedHeight),
+                    aircraftCount = aircraft.size,
+                    selectedAircraft = selectedAircraft,
+                    interceptStatus = interceptStatus,
+                )
+            },
+            scaffoldState = scaffoldState,
+            sheetPeekHeight = peekHeight,
+            sheetContainerColor = MaterialTheme.colorScheme.surface,
+            sheetContentColor = MaterialTheme.colorScheme.onSurface,
+        ) { innerPadding ->
+            Box(modifier = Modifier.fillMaxSize()) {
+                GoogleMap(
+                    modifier = Modifier.fillMaxSize(),
+                    cameraPositionState = cameraPositionState,
+                    properties = mapProperties,
+                    uiSettings = mapUiSettings,
+                    onMapClick = { viewModel.selectAircraft(null) },
+                ) {
+                    aircraft.forEach { ac ->
+                        key(ac.icao) {
+                            AircraftMarker(
+                                aircraft = ac,
+                                isSelected = ac.icao == selectedAircraft?.icao,
+                                onClick = { viewModel.selectAircraft(ac) },
+                            )
+                        }
+                    }
+                    targetCoordinate?.let { target ->
+                        TargetMarker(position = target)
+                    }
+                }
+
+                TargetSearchBar(
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .padding(top = 16.dp, start = 16.dp, end = 16.dp),
+                    hasActiveTarget = targetCoordinate != null,
+                    onSearch = viewModel::searchTarget,
+                    onClear = viewModel::clearTarget,
+                )
+
+                FloatingActionButton(
+                    onClick = {
+                        coroutineScope.launch {
+                            cameraPositionState.animate(
+                                CameraUpdateFactory.newCameraPosition(
+                                    CameraPosition.fromLatLngZoom(operationalCenter, OPERATIONAL_ZOOM),
+                                ),
+                                CAMERA_ANIMATION_DURATION_MS,
+                            )
+                        }
+                    },
+                    modifier = Modifier
+                        .align(Alignment.BottomEnd)
+                        .padding(end = 16.dp, bottom = innerPadding.calculateBottomPadding() + 16.dp),
+                ) {
+                    Icon(Icons.Default.MyLocation, contentDescription = "Recenter on operational area")
+                }
             }
         }
     }
 }
 
 @Composable
-private fun AircraftMarker(aircraft: Aircraft) {
+private fun AircraftMarker(aircraft: Aircraft, isSelected: Boolean, onClick: () -> Unit) {
     val lat = aircraft.lat ?: return
     val lon = aircraft.lon ?: return
     val position = LatLng(lat, lon)
@@ -76,8 +235,169 @@ private fun AircraftMarker(aircraft: Aircraft) {
         rotation = aircraft.track?.toFloat() ?: 0f,
         flat = true,
         anchor = Offset(0.5f, 0.5f),
-        icon = BitmapDescriptorFactory.defaultMarker(BitmapDescriptorFactory.HUE_AZURE),
+        icon = BitmapDescriptorFactory.defaultMarker(
+            if (isSelected) BitmapDescriptorFactory.HUE_YELLOW else BitmapDescriptorFactory.HUE_AZURE,
+        ),
         title = aircraft.displayName,
         snippet = "$altitudeLabel • $speedLabel",
+        onClick = {
+            onClick()
+            true
+        },
+    )
+}
+
+@Composable
+private fun TargetMarker(position: LatLng) {
+    val markerState = rememberUpdatedMarkerState(position = position)
+    Marker(
+        state = markerState,
+        icon = BitmapDescriptorFactory.defaultMarker(BitmapDescriptorFactory.HUE_RED),
+        title = "Intercept Target",
+        zIndex = 2f,
+    )
+    Circle(
+        center = position,
+        radius = 1500.0,
+        strokeColor = Color(0xFFFF5252),
+        strokeWidth = 4f,
+        fillColor = Color.Transparent,
+    )
+}
+
+@Composable
+private fun TargetSearchBar(
+    modifier: Modifier = Modifier,
+    hasActiveTarget: Boolean,
+    onSearch: (String) -> Unit,
+    onClear: () -> Unit,
+) {
+    var query by remember { mutableStateOf("") }
+    val keyboardController = LocalSoftwareKeyboardController.current
+
+    Surface(
+        modifier = modifier.widthIn(max = 420.dp),
+        shape = RoundedCornerShape(28.dp),
+        color = MaterialTheme.colorScheme.surface,
+        tonalElevation = 4.dp,
+        shadowElevation = 4.dp,
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
+        ) {
+            Icon(
+                imageVector = Icons.Default.Search,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            TextField(
+                value = query,
+                onValueChange = { query = it },
+                modifier = Modifier.weight(1f),
+                placeholder = { Text("Intercept address…") },
+                singleLine = true,
+                colors = TextFieldDefaults.colors(
+                    unfocusedContainerColor = Color.Transparent,
+                    focusedContainerColor = Color.Transparent,
+                    unfocusedIndicatorColor = Color.Transparent,
+                    focusedIndicatorColor = Color.Transparent,
+                ),
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                keyboardActions = KeyboardActions(
+                    onSearch = {
+                        onSearch(query)
+                        keyboardController?.hide()
+                    },
+                ),
+            )
+            if (hasActiveTarget || query.isNotEmpty()) {
+                IconButton(
+                    onClick = {
+                        query = ""
+                        onClear()
+                        keyboardController?.hide()
+                    },
+                ) {
+                    Icon(Icons.Default.Close, contentDescription = "Clear target")
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun StatusSheetContent(
+    modifier: Modifier = Modifier,
+    aircraftCount: Int,
+    selectedAircraft: Aircraft?,
+    interceptStatus: InterceptStatus?,
+) {
+    Column(
+        modifier = modifier
+            .background(MaterialTheme.colorScheme.surface)
+            .padding(horizontal = 20.dp, vertical = 12.dp),
+    ) {
+        Text(
+            text = "$aircraftCount aircraft tracked in region",
+            style = MaterialTheme.typography.titleMedium,
+            color = MaterialTheme.colorScheme.onSurface,
+        )
+        Spacer(Modifier.height(16.dp))
+        when {
+            selectedAircraft != null -> AircraftDetailGrid(selectedAircraft)
+            interceptStatus != null -> InterceptDetailLine(interceptStatus)
+            else -> Text(
+                text = "Tap an aircraft marker for details",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+@Composable
+private fun AircraftDetailGrid(aircraft: Aircraft) {
+    Column {
+        Text(
+            text = aircraft.displayName,
+            style = MaterialTheme.typography.headlineSmall,
+            color = MaterialTheme.colorScheme.onSurface,
+        )
+        Spacer(Modifier.height(8.dp))
+        Row(
+            horizontalArrangement = Arrangement.SpaceBetween,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            StatField(label = "Groundspeed", value = aircraft.groundSpeedKts?.let { "${it.toInt()} kt" } ?: "—")
+            StatField(label = "Altitude", value = aircraft.altitudeFeet?.let { "$it ft" } ?: "—")
+            StatField(label = "Heading", value = aircraft.track?.let { "${it.toInt()}°" } ?: "—")
+        }
+    }
+}
+
+@Composable
+private fun StatField(label: String, value: String) {
+    Column {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Text(
+            text = value,
+            style = MaterialTheme.typography.titleLarge,
+            color = MaterialTheme.colorScheme.onSurface,
+        )
+    }
+}
+
+@Composable
+private fun InterceptDetailLine(status: InterceptStatus) {
+    val trend = if (status.isClosing) "closing" else "opening"
+    Text(
+        text = "${status.aircraft.displayName} $trend on target — ${"%.1f".format(status.distanceNm)} nm",
+        style = MaterialTheme.typography.bodyLarge,
+        color = MaterialTheme.colorScheme.onSurface,
     )
 }
