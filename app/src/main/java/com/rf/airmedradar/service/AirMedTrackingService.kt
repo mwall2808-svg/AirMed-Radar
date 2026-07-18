@@ -9,6 +9,7 @@ import android.content.Intent
 import android.location.Location
 import android.os.Binder
 import android.os.IBinder
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import com.google.android.gms.maps.model.LatLng
@@ -20,6 +21,9 @@ import com.rf.airmedradar.data.GeocodingService
 import com.rf.airmedradar.data.NetworkUtils
 import com.rf.airmedradar.data.isRotorcraft
 import com.rf.airmedradar.util.formatEtaSeconds
+import java.io.IOException
+import java.net.SocketTimeoutException
+import java.net.UnknownHostException
 import kotlin.math.asin
 import kotlin.math.atan2
 import kotlin.math.cos
@@ -149,23 +153,40 @@ class AirMedTrackingService : Service() {
         }
     }
 
+    /**
+     * Pulls the latest telemetry batch. On any network failure, last-known aircraft
+     * positions are simply left in place (`_liveAircraft` is untouched) and the next
+     * scheduled tick retries cleanly — a dropped signal never crashes this service.
+     */
     private suspend fun refreshAircraft() {
         if (!NetworkUtils.isOnline(applicationContext)) {
             _isOffline.value = true
+            Log.w(TAG, "Skipping poll: device reports no active network")
             return
         }
-        runCatching {
-            repository.fetchAircraftNear(
+        try {
+            val fetched = repository.fetchAircraftNear(
                 lat = OPERATIONAL_CENTER_LAT,
                 lon = OPERATIONAL_CENTER_LON,
                 radiusNm = TRACKING_RADIUS_NM,
             )
-        }.onSuccess { fetched ->
             val rotorcraft = fetched.filter { it.hasPosition && it.isRotorcraft() }
             _liveAircraft.value = rotorcraft
             _isOffline.value = false
             updateInterceptStatus(rotorcraft)
-        }.onFailure {
+        } catch (e: UnknownHostException) {
+            Log.w(TAG, "adsb.lol unreachable (no DNS/connectivity) — retaining last known positions", e)
+            _isOffline.value = true
+        } catch (e: SocketTimeoutException) {
+            Log.w(TAG, "adsb.lol request timed out — retaining last known positions", e)
+            _isOffline.value = true
+        } catch (e: IOException) {
+            Log.w(TAG, "adsb.lol network I/O failure — retaining last known positions", e)
+            _isOffline.value = true
+        } catch (e: Exception) {
+            // Last line of defense: an unexpected SDK/runtime exception must never take
+            // down a foreground service running unattended for an entire shift.
+            Log.e(TAG, "Unexpected error refreshing aircraft telemetry", e)
             _isOffline.value = true
         }
     }
@@ -258,8 +279,8 @@ class AirMedTrackingService : Service() {
     }
 
     private fun estimateEtaSeconds(status: InterceptStatus): Long {
-        val speed = status.aircraft.groundSpeedKts
-        return if (speed != null && speed > 1.0) (status.distanceNm / speed * 3_600).toLong() else UNKNOWN_ETA_SECONDS
+        val speed = status.aircraft.safeGroundSpeedKts
+        return if (speed > 1.0) (status.distanceNm / speed * 3_600).toLong() else UNKNOWN_ETA_SECONDS
     }
 
     /** 5 NM inbound heads-up alert (edge-triggered) and sticky on-scene/landed detection. */
@@ -414,6 +435,7 @@ class AirMedTrackingService : Service() {
     companion object {
         const val EXTRA_FOCUS_LZ = "com.rf.airmedradar.extra.FOCUS_LZ"
 
+        private const val TAG = "AirMedTrackingService"
         private const val TRACKING_CHANNEL_ID = "hems_tracking_service"
         private const val ALERT_CHANNEL_ID = "hems_inbound_alerts"
         private const val TRACKING_NOTIFICATION_ID = 1001

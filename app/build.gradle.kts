@@ -1,16 +1,8 @@
-import java.util.Properties
-
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.kotlin.serialization)
-}
-
-val localProperties = Properties().apply {
-    val localPropertiesFile = rootProject.file("local.properties")
-    if (localPropertiesFile.exists()) {
-        localPropertiesFile.inputStream().use { load(it) }
-    }
+    alias(libs.plugins.secrets.gradle.plugin)
 }
 
 android {
@@ -27,7 +19,6 @@ android {
         versionName = "1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-        manifestPlaceholders["MAPS_API_KEY"] = localProperties.getProperty("MAPS_API_KEY", "")
     }
 
     buildTypes {
@@ -44,6 +35,13 @@ android {
     buildFeatures {
         compose = true
     }
+}
+
+secrets {
+    // Real secrets live here, gitignored — never committed.
+    propertiesFileName = "local.properties"
+    // Tracked in git so a fresh clone / CI still builds; holds only placeholder values.
+    defaultPropertiesFileName = "local.defaults.properties"
 }
 
 dependencies {

@@ -38,14 +38,20 @@ data class Aircraft(
 
     val hasPosition: Boolean
         get() = lat != null && lon != null
-}
 
-@Serializable
-data class AdsbLolResponse(
-    @SerialName("ac") val aircraft: List<Aircraft> = emptyList(),
-    @SerialName("total") val total: Int = 0,
-    @SerialName("now") val serverTimestamp: Double = 0.0,
-)
+    // Safe, non-null fallbacks for consumers that structurally require a primitive value
+    // (e.g. a Compose Marker's `rotation: Float` param, or flight-path math) rather than
+    // repeating `?: 0f` / `?: 0` at every call site. Display code that wants to distinguish
+    // "no data" from "genuinely zero" should keep using the nullable fields directly.
+    val safeTrackDegrees: Float
+        get() = track?.toFloat() ?: 0f
+
+    val safeAltitudeFeet: Int
+        get() = altitudeFeet ?: 0
+
+    val safeGroundSpeedKts: Double
+        get() = groundSpeedKts ?: 0.0
+}
 
 /** ADS-B emitter category for rotorcraft per DO-260B Table 2-38. */
 private const val ROTORCRAFT_CATEGORY = "A7"

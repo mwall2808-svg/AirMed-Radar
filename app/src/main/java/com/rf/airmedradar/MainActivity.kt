@@ -319,7 +319,7 @@ private fun AircraftMarker(aircraft: Aircraft, isSelected: Boolean, onClick: () 
     Marker(
         state = markerState,
         // Rotates the icon to match true track over the ground.
-        rotation = aircraft.track?.toFloat() ?: 0f,
+        rotation = aircraft.safeTrackDegrees,
         flat = true,
         anchor = Offset(0.5f, 0.5f),
         icon = BitmapDescriptorFactory.defaultMarker(hue),

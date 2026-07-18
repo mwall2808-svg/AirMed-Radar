@@ -15,6 +15,7 @@ ktor = "3.0.3"
 kotlinxSerializationJson = "1.7.3"
 kotlinxCoroutines = "1.9.0"
 places = "4.0.0"
+secretsGradlePlugin = "2.0.1"
 
 [libraries]
 play-services-maps = { group = "com.google.android.gms", name = "play-services-maps", version.ref = "playServicesMaps" }
@@ -51,4 +52,5 @@ androidx-compose-material-icons-extended = { group = "androidx.compose.material"
 android-application = { id = "com.android.application", version.ref = "agp" }
 kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
 kotlin-serialization = { id = "org.jetbrains.kotlin.plugin.serialization", version.ref = "kotlin" }
+secrets-gradle-plugin = { id = "com.google.android.libraries.mapsplatform.secrets-gradle-plugin", version.ref = "secretsGradlePlugin" }
 
