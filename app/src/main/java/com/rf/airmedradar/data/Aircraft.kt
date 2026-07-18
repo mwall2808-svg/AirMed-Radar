@@ -26,6 +26,9 @@ data class Aircraft(
     @SerialName("alt_geom") val altGeom: Double? = null,
     @SerialName("gs") val groundSpeedKts: Double? = null,
     @SerialName("track") val track: Double? = null,
+    // Not part of the adsb.lol wire format; flags the calibration aircraft ("MOCK911")
+    // so it renders distinctly and is excluded from real-telemetry refresh matching.
+    val isSimulated: Boolean = false,
 ) {
     val displayName: String
         get() = callsign?.trim()?.takeIf { it.isNotBlank() } ?: registration ?: icao

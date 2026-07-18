@@ -17,11 +17,12 @@ object GeocodingService {
 
     suspend fun resolveAddress(context: Context, query: String): LatLng? {
         if (query.isBlank()) return null
+        val normalizedQuery = AddressQueryNormalizer.normalize(query)
         val geocoder = Geocoder(context)
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            resolveAsync(geocoder, query)
+            resolveAsync(geocoder, normalizedQuery)
         } else {
-            resolveBlocking(geocoder, query)
+            resolveBlocking(geocoder, normalizedQuery)
         }
     }
 

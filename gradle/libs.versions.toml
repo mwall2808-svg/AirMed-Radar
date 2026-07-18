@@ -9,6 +9,7 @@ activityCompose = "1.13.0"
 kotlin = "2.2.10"
 composeBom = "2026.02.01"
 playServicesMaps = "19.2.0"
+playServicesLocation = "21.3.0"
 mapsCompose = "6.7.2"
 ktor = "3.0.3"
 kotlinxSerializationJson = "1.7.3"
@@ -16,6 +17,7 @@ kotlinxCoroutines = "1.9.0"
 
 [libraries]
 play-services-maps = { group = "com.google.android.gms", name = "play-services-maps", version.ref = "playServicesMaps" }
+play-services-location = { group = "com.google.android.gms", name = "play-services-location", version.ref = "playServicesLocation" }
 maps-compose = { group = "com.google.maps.android", name = "maps-compose", version.ref = "mapsCompose" }
 ktor-client-core = { group = "io.ktor", name = "ktor-client-core", version.ref = "ktor" }
 ktor-client-android = { group = "io.ktor", name = "ktor-client-android", version.ref = "ktor" }

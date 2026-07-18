@@ -1,9 +1,14 @@
 package com.rf.airmedradar
 
+import android.Manifest
+import android.content.Context
+import android.content.pm.PackageManager
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -52,6 +57,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.google.android.gms.maps.CameraUpdateFactory
@@ -71,6 +77,7 @@ import com.rf.airmedradar.data.Aircraft
 import com.rf.airmedradar.ui.theme.AirMedRadarTheme
 import com.rf.airmedradar.viewmodel.AirMedRadarViewModel
 import com.rf.airmedradar.viewmodel.InterceptStatus
+import com.rf.airmedradar.viewmodel.SimulationStatus
 import kotlinx.coroutines.launch
 
 private const val OPERATIONAL_LAT = 39.0
@@ -91,6 +98,12 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+private fun hasLocationPermission(context: Context): Boolean {
+    val fine = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION)
+    val coarse = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_COARSE_LOCATION)
+    return fine == PackageManager.PERMISSION_GRANTED || coarse == PackageManager.PERMISSION_GRANTED
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun RadarScreen(viewModel: AirMedRadarViewModel, modifier: Modifier = Modifier) {
@@ -98,16 +111,34 @@ fun RadarScreen(viewModel: AirMedRadarViewModel, modifier: Modifier = Modifier) 
     val selectedAircraft by viewModel.selectedAircraft.collectAsStateWithLifecycle()
     val targetCoordinate by viewModel.targetCoordinate.collectAsStateWithLifecycle()
     val interceptStatus by viewModel.interceptStatus.collectAsStateWithLifecycle()
+    val simulationStatus by viewModel.simulationStatus.collectAsStateWithLifecycle()
 
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
     val operationalCenter = remember { LatLng(OPERATIONAL_LAT, OPERATIONAL_LON) }
 
+    var hasLocationPermission by remember { mutableStateOf(hasLocationPermission(context)) }
+    val locationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions(),
+    ) { grants ->
+        hasLocationPermission = grants.values.any { it }
+    }
+    LaunchedEffect(Unit) {
+        if (!hasLocationPermission) {
+            locationPermissionLauncher.launch(
+                arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION),
+            )
+        }
+    }
+
     val cameraPositionState = rememberCameraPositionState {
         position = CameraPosition.fromLatLngZoom(operationalCenter, OPERATIONAL_ZOOM)
     }
-    val mapProperties = remember {
-        MapProperties(mapStyleOptions = MapStyleOptions.loadRawResourceStyle(context, R.raw.map_style_dark))
+    val mapProperties = remember(hasLocationPermission) {
+        MapProperties(
+            isMyLocationEnabled = hasLocationPermission,
+            mapStyleOptions = MapStyleOptions.loadRawResourceStyle(context, R.raw.map_style_dark),
+        )
     }
     val mapUiSettings = remember {
         MapUiSettings(
@@ -155,9 +186,10 @@ fun RadarScreen(viewModel: AirMedRadarViewModel, modifier: Modifier = Modifier) 
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(expandedHeight),
-                    aircraftCount = aircraft.size,
+                    aircraftCount = aircraft.count { !it.isSimulated },
                     selectedAircraft = selectedAircraft,
                     interceptStatus = interceptStatus,
+                    simulationStatus = simulationStatus,
                 )
             },
             scaffoldState = scaffoldState,
@@ -183,7 +215,7 @@ fun RadarScreen(viewModel: AirMedRadarViewModel, modifier: Modifier = Modifier) 
                         }
                     }
                     targetCoordinate?.let { target ->
-                        TargetMarker(position = target)
+                        SceneLzMarker(position = target)
                     }
                 }
 
@@ -228,6 +260,13 @@ private fun AircraftMarker(aircraft: Aircraft, isSelected: Boolean, onClick: () 
 
     val altitudeLabel = aircraft.altitudeFeet?.let { "$it ft" } ?: "Alt N/A"
     val speedLabel = aircraft.groundSpeedKts?.let { "${it.toInt()} kt" } ?: "GS N/A"
+    val simulatedSuffix = if (aircraft.isSimulated) " • SIMULATED" else ""
+
+    val hue = when {
+        isSelected -> BitmapDescriptorFactory.HUE_YELLOW
+        aircraft.isSimulated -> BitmapDescriptorFactory.HUE_VIOLET
+        else -> BitmapDescriptorFactory.HUE_AZURE
+    }
 
     Marker(
         state = markerState,
@@ -235,11 +274,9 @@ private fun AircraftMarker(aircraft: Aircraft, isSelected: Boolean, onClick: () 
         rotation = aircraft.track?.toFloat() ?: 0f,
         flat = true,
         anchor = Offset(0.5f, 0.5f),
-        icon = BitmapDescriptorFactory.defaultMarker(
-            if (isSelected) BitmapDescriptorFactory.HUE_YELLOW else BitmapDescriptorFactory.HUE_AZURE,
-        ),
+        icon = BitmapDescriptorFactory.defaultMarker(hue),
         title = aircraft.displayName,
-        snippet = "$altitudeLabel • $speedLabel",
+        snippet = "$altitudeLabel • $speedLabel$simulatedSuffix",
         onClick = {
             onClick()
             true
@@ -247,21 +284,27 @@ private fun AircraftMarker(aircraft: Aircraft, isSelected: Boolean, onClick: () 
     )
 }
 
+/** The searched intercept point: a highly visible amber landing-zone pin + reticle. */
 @Composable
-private fun TargetMarker(position: LatLng) {
+private fun SceneLzMarker(position: LatLng) {
     val markerState = rememberUpdatedMarkerState(position = position)
+    LaunchedEffect(position) {
+        // Auto-reveal the label instead of requiring a tap — this pin needs to read at a glance.
+        markerState.showInfoWindow()
+    }
     Marker(
         state = markerState,
-        icon = BitmapDescriptorFactory.defaultMarker(BitmapDescriptorFactory.HUE_RED),
-        title = "Intercept Target",
+        icon = BitmapDescriptorFactory.defaultMarker(BitmapDescriptorFactory.HUE_ORANGE),
+        title = "DESIGNATED SCENE LZ",
+        snippet = "Intercept target",
         zIndex = 2f,
     )
     Circle(
         center = position,
-        radius = 1500.0,
-        strokeColor = Color(0xFFFF5252),
-        strokeWidth = 4f,
-        fillColor = Color.Transparent,
+        radius = 1200.0,
+        strokeColor = Color(0xFFFFA000),
+        strokeWidth = 5f,
+        fillColor = Color(0x22FFA000),
     )
 }
 
@@ -295,7 +338,7 @@ private fun TargetSearchBar(
                 value = query,
                 onValueChange = { query = it },
                 modifier = Modifier.weight(1f),
-                placeholder = { Text("Intercept address…") },
+                placeholder = { Text("Address or intersection…") },
                 singleLine = true,
                 colors = TextFieldDefaults.colors(
                     unfocusedContainerColor = Color.Transparent,
@@ -332,6 +375,7 @@ private fun StatusSheetContent(
     aircraftCount: Int,
     selectedAircraft: Aircraft?,
     interceptStatus: InterceptStatus?,
+    simulationStatus: SimulationStatus?,
 ) {
     Column(
         modifier = modifier
@@ -343,6 +387,14 @@ private fun StatusSheetContent(
             style = MaterialTheme.typography.titleMedium,
             color = MaterialTheme.colorScheme.onSurface,
         )
+        if (simulationStatus != null) {
+            Text(
+                text = "MOCK911 inbound — ${"%.1f".format(simulationStatus.distanceNm)} nm • " +
+                    "ETA ${formatEta(simulationStatus.etaSeconds)}",
+                style = MaterialTheme.typography.labelMedium,
+                color = Color(0xFFFFA000),
+            )
+        }
         Spacer(Modifier.height(16.dp))
         when {
             selectedAircraft != null -> AircraftDetailGrid(selectedAircraft)
@@ -400,4 +452,10 @@ private fun InterceptDetailLine(status: InterceptStatus) {
         style = MaterialTheme.typography.bodyLarge,
         color = MaterialTheme.colorScheme.onSurface,
     )
+}
+
+private fun formatEta(totalSeconds: Long): String {
+    val minutes = totalSeconds / 60
+    val seconds = totalSeconds % 60
+    return "%02d:%02d".format(minutes, seconds)
 }
