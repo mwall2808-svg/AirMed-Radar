@@ -353,28 +353,33 @@ private fun AircraftEtaLabel(aircraft: Aircraft, targetCoordinate: LatLng?) {
     val lat = aircraft.lat ?: return
     val lon = aircraft.lon ?: return
     val position = LatLng(lat, lon)
-    val markerState = rememberUpdatedMarkerState(position = position)
 
     // Aircraft is a data class, so any position/speed/track change from the 3s sim tick or
-    // 12s network poll produces a new instance — Compose recomposes this label automatically.
+    // 12s network poll produces a new instance, recomposing this function with fresh text —
+    // but MarkerComposable bakes its content into a bitmap once and doesn't reliably observe
+    // later content-only recompositions. Keying on the text forces the marker's composition
+    // slot to be torn down and recreated whenever it changes, guaranteeing a fresh bake.
     val labelText = aircraftLabelText(aircraft, targetCoordinate)
 
-    MarkerComposable(
-        state = markerState,
-        anchor = Offset(0.5f, 0f),
-        flat = false,
-        zIndex = 1f,
-    ) {
-        Text(
-            text = labelText,
-            color = Color.White,
-            fontSize = 10.sp,
-            fontWeight = FontWeight.Bold,
-            modifier = Modifier
-                .padding(top = 22.dp) // clears the icon graphic above before the pill starts
-                .background(Color.Black.copy(alpha = 0.78f), RoundedCornerShape(4.dp))
-                .padding(horizontal = 5.dp, vertical = 1.dp),
-        )
+    key(labelText) {
+        val markerState = rememberUpdatedMarkerState(position = position)
+        MarkerComposable(
+            state = markerState,
+            anchor = Offset(0.5f, 0f),
+            flat = false,
+            zIndex = 1f,
+        ) {
+            Text(
+                text = labelText,
+                color = Color.White,
+                fontSize = 10.sp,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier
+                    .padding(top = 22.dp) // clears the icon graphic above before the pill starts
+                    .background(Color.Black.copy(alpha = 0.78f), RoundedCornerShape(4.dp))
+                    .padding(horizontal = 5.dp, vertical = 1.dp),
+            )
+        }
     }
 }
 
