@@ -17,6 +17,8 @@ import com.rf.airmedradar.data.Aircraft
 import com.rf.airmedradar.data.DiscoveredHemsProvider
 import com.rf.airmedradar.data.PlacesAutocompleteRepository
 import com.rf.airmedradar.data.WeatherRepository
+import com.rf.airmedradar.data.fleet.HemsFleetDatabase
+import com.rf.airmedradar.data.fleet.HemsProviderEntity
 import com.rf.airmedradar.service.AirMedTrackingService
 import com.rf.airmedradar.service.InterceptStatus
 import com.rf.airmedradar.service.TrackingSnapshot
@@ -111,6 +113,27 @@ class AirMedRadarViewModel(application: Application) : AndroidViewModel(applicat
     /** Dispatcher confirmed [provider] as the responding unit from the HEMS selection dialog. */
     fun selectDispatchedProvider(provider: DiscoveredHemsProvider) {
         _dispatchedProvider.value = provider
+    }
+
+    // --- Custom provider management: appends a dispatcher-entered operator to the Phase 9.7
+    // national fleet registry. Kept separate from [discoveredProviders]/[dispatchedProvider]
+    // above — this writes to the persisted Room baseline, not the live per-poll ADS-B list. ---
+
+    private val hemsProviderDao = HemsFleetDatabase.getInstance(application).hemsProviderDao()
+
+    /**
+     * Inserts a dispatcher-entered operator as a custom row (`isCustom = true`), distinguishing
+     * it from the factory-seeded baseline. [providerName] and [tailNumbers] are expected
+     * already validated/sanitized by the caller (see [com.rf.airmedradar.data.fleet.parseTailNumbers]
+     * and the entry dialog's own blank-field checks) — this function does no validation of its
+     * own, it just persists what it's given.
+     */
+    fun saveCustomProvider(providerName: String, tailNumbers: List<String>) {
+        viewModelScope.launch {
+            hemsProviderDao.insertProvider(
+                HemsProviderEntity(providerName = providerName, tailNumbers = tailNumbers, isCustom = true),
+            )
+        }
     }
 
     /**

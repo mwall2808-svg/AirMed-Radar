@@ -55,6 +55,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.SearchBar
 import androidx.compose.material3.SearchBarDefaults
 import androidx.compose.material3.SheetValue
@@ -107,6 +108,7 @@ import com.google.maps.android.compose.rememberUpdatedMarkerState
 import com.google.android.libraries.places.api.model.AutocompletePrediction
 import com.rf.airmedradar.data.Aircraft
 import com.rf.airmedradar.data.DiscoveredHemsProvider
+import com.rf.airmedradar.data.fleet.parseTailNumbers
 import com.rf.airmedradar.service.AirMedTrackingService
 import com.rf.airmedradar.service.InterceptStatus
 import com.rf.airmedradar.ui.theme.AirMedRadarTheme
@@ -247,6 +249,7 @@ fun RadarScreen(viewModel: AirMedRadarViewModel, modifier: Modifier = Modifier) 
     // — a dispatcher who just resolved an address wants to see that arrival point and its
     // immediate surroundings, not a wide shot stretched to also frame wherever the phone is.
     var showHemsSelectionDialog by remember { mutableStateOf(false) }
+    var showCustomProviderDialog by remember { mutableStateOf(false) }
     LaunchedEffect(targetCoordinate, lzFocusRequestId) {
         val target = targetCoordinate ?: return@LaunchedEffect
         runCatching {
@@ -422,7 +425,21 @@ fun RadarScreen(viewModel: AirMedRadarViewModel, modifier: Modifier = Modifier) 
                 viewModel.selectDispatchedProvider(provider)
                 showHemsSelectionDialog = false
             },
+            onAddCustomProvider = {
+                showHemsSelectionDialog = false
+                showCustomProviderDialog = true
+            },
             onDismiss = { showHemsSelectionDialog = false },
+        )
+    }
+
+    if (showCustomProviderDialog) {
+        CustomProviderEntryDialog(
+            onSave = { name, tailNumbers ->
+                viewModel.saveCustomProvider(name, tailNumbers)
+                showCustomProviderDialog = false
+            },
+            onDismiss = { showCustomProviderDialog = false },
         )
     }
 }
@@ -438,6 +455,7 @@ fun RadarScreen(viewModel: AirMedRadarViewModel, modifier: Modifier = Modifier) 
 private fun HemsProviderSelectionDialog(
     providers: List<DiscoveredHemsProvider>,
     onSelect: (DiscoveredHemsProvider) -> Unit,
+    onAddCustomProvider: () -> Unit,
     onDismiss: () -> Unit,
 ) {
     AlertDialog(
@@ -484,6 +502,86 @@ private fun HemsProviderSelectionDialog(
             }
         },
         confirmButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        },
+        // Not the aircraft actually responding to this dispatch — a way out to the Phase 9.8
+        // entry screen for a provider that simply isn't in the live telemetry-derived list
+        // above (wrong type code, transponder off, out of the poll radius, etc.).
+        dismissButton = {
+            TextButton(onClick = onAddCustomProvider) { Text("Add Custom Provider") }
+        },
+    )
+}
+
+/**
+ * Low-friction entry screen for a dispatcher-known operator that discovery didn't surface.
+ * Both fields show a standard Material error state (red outline + supporting text) on Save
+ * if left blank — the same visual language Compose's `OutlinedTextField` already uses
+ * elsewhere, not a bespoke error treatment invented for this one screen.
+ */
+@Composable
+private fun CustomProviderEntryDialog(
+    onSave: (providerName: String, tailNumbers: List<String>) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var providerName by rememberSaveable { mutableStateOf("") }
+    var tailNumbersText by rememberSaveable { mutableStateOf("") }
+    var nameError by rememberSaveable { mutableStateOf(false) }
+    var tailNumbersError by rememberSaveable { mutableStateOf(false) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Add Custom Provider") },
+        text = {
+            Column {
+                OutlinedTextField(
+                    value = providerName,
+                    onValueChange = {
+                        providerName = it
+                        nameError = false
+                    },
+                    label = { Text("Company/Provider Name") },
+                    placeholder = { Text("Custom MedFlight") },
+                    singleLine = true,
+                    isError = nameError,
+                    supportingText = {
+                        if (nameError) Text("Enter a provider name")
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Spacer(Modifier.height(12.dp))
+                OutlinedTextField(
+                    value = tailNumbersText,
+                    onValueChange = {
+                        tailNumbersText = it
+                        tailNumbersError = false
+                    },
+                    label = { Text("Tail Numbers") },
+                    placeholder = { Text("Enter tail numbers separated by commas (e.g., N123MED, N456MED)") },
+                    isError = tailNumbersError,
+                    supportingText = {
+                        if (tailNumbersError) Text("Enter at least one tail number")
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = {
+                    val cleanName = providerName.trim()
+                    val cleanTailNumbers = parseTailNumbers(tailNumbersText)
+                    nameError = cleanName.isBlank()
+                    tailNumbersError = cleanTailNumbers.isEmpty()
+                    if (!nameError && !tailNumbersError) {
+                        onSave(cleanName, cleanTailNumbers)
+                    }
+                },
+            ) {
+                Text("Save Provider")
+            }
+        },
+        dismissButton = {
             TextButton(onClick = onDismiss) { Text("Cancel") }
         },
     )
