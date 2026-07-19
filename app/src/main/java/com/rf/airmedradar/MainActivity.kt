@@ -31,17 +31,24 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.MyLocation
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.BottomSheetScaffold
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
@@ -53,6 +60,7 @@ import androidx.compose.material3.SearchBarDefaults
 import androidx.compose.material3.SheetValue
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberBottomSheetScaffoldState
 import androidx.compose.material3.rememberStandardBottomSheetState
 import androidx.compose.runtime.Composable
@@ -98,6 +106,7 @@ import com.google.maps.android.compose.rememberCameraPositionState
 import com.google.maps.android.compose.rememberUpdatedMarkerState
 import com.google.android.libraries.places.api.model.AutocompletePrediction
 import com.rf.airmedradar.data.Aircraft
+import com.rf.airmedradar.data.DiscoveredHemsProvider
 import com.rf.airmedradar.service.AirMedTrackingService
 import com.rf.airmedradar.service.InterceptStatus
 import com.rf.airmedradar.ui.theme.AirMedRadarTheme
@@ -170,6 +179,7 @@ fun RadarScreen(viewModel: AirMedRadarViewModel, modifier: Modifier = Modifier) 
     val searchQuery by viewModel.searchQuery.collectAsStateWithLifecycle()
     val addressSuggestions by viewModel.addressSuggestions.collectAsStateWithLifecycle()
     val deviceLocation by viewModel.deviceLocation.collectAsStateWithLifecycle()
+    val discoveredProviders by viewModel.discoveredProviders.collectAsStateWithLifecycle()
 
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
@@ -236,6 +246,7 @@ fun RadarScreen(viewModel: AirMedRadarViewModel, modifier: Modifier = Modifier) 
     // center+zoom on the LZ itself (not a bounds-fit including the device/operational center)
     // — a dispatcher who just resolved an address wants to see that arrival point and its
     // immediate surroundings, not a wide shot stretched to also frame wherever the phone is.
+    var showHemsSelectionDialog by remember { mutableStateOf(false) }
     LaunchedEffect(targetCoordinate, lzFocusRequestId) {
         val target = targetCoordinate ?: return@LaunchedEffect
         runCatching {
@@ -244,6 +255,10 @@ fun RadarScreen(viewModel: AirMedRadarViewModel, modifier: Modifier = Modifier) 
                 CAMERA_ANIMATION_DURATION_MS,
             )
         }
+        // `animate()` suspends until the pan/zoom actually finishes (or is cancelled), so this
+        // line only runs once the camera has visibly settled on the LZ — exactly "the moment
+        // the camera centering loop finishes," not merely "the moment it was requested."
+        showHemsSelectionDialog = true
     }
 
     // Snap the camera to the device's own position the moment a fresh GPS lock is established
@@ -399,6 +414,79 @@ fun RadarScreen(viewModel: AirMedRadarViewModel, modifier: Modifier = Modifier) 
             }
         }
     }
+
+    if (showHemsSelectionDialog) {
+        HemsProviderSelectionDialog(
+            providers = discoveredProviders,
+            onSelect = { provider ->
+                viewModel.selectDispatchedProvider(provider)
+                showHemsSelectionDialog = false
+            },
+            onDismiss = { showHemsSelectionDialog = false },
+        )
+    }
+}
+
+/**
+ * Pops the instant the camera finishes centering on a newly-resolved LZ, listing only the
+ * HEMS operators [com.rf.airmedradar.data.discoverHemsProviders] actually sees airborne in the
+ * current telemetry batch — never a fixed roster. The list is live: since [providers] is
+ * collected straight from the ViewModel's StateFlow, a provider that appears or drops out of
+ * range between polls updates this dialog in place while it's still open.
+ */
+@Composable
+private fun HemsProviderSelectionDialog(
+    providers: List<DiscoveredHemsProvider>,
+    onSelect: (DiscoveredHemsProvider) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Select Dispatched HEMS") },
+        text = {
+            if (providers.isEmpty()) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 24.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                    Spacer(Modifier.width(12.dp))
+                    Text(
+                        text = "Scanning local airspace for HEMS transponders…",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                }
+            } else {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 320.dp)
+                        .verticalScroll(rememberScrollState()),
+                ) {
+                    providers.forEach { provider ->
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { onSelect(provider) }
+                                .padding(vertical = 12.dp),
+                        ) {
+                            Text(text = provider.name, style = MaterialTheme.typography.bodyLarge)
+                            Text(
+                                text = provider.tailNumbers.joinToString(", "),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        },
+    )
 }
 
 /**

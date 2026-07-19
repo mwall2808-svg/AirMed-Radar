@@ -100,6 +100,20 @@ class AirMedRadarViewModel(application: Application) : AndroidViewModel(applicat
     val selectedAircraft: StateFlow<Aircraft?> = _selectedAircraft.asStateFlow()
 
     /**
+     * The primary tracking state flag: which provider the dispatcher confirmed as the actual
+     * responding unit from the HEMS selection dialog, and the tail numbers that dispatch
+     * covers. Null until a provider is picked; [clearTarget] resets it alongside the LZ itself
+     * since a cleared target has no responding unit to speak of.
+     */
+    private val _dispatchedProvider = MutableStateFlow<DiscoveredHemsProvider?>(null)
+    val dispatchedProvider: StateFlow<DiscoveredHemsProvider?> = _dispatchedProvider.asStateFlow()
+
+    /** Dispatcher confirmed [provider] as the responding unit from the HEMS selection dialog. */
+    fun selectDispatchedProvider(provider: DiscoveredHemsProvider) {
+        _dispatchedProvider.value = provider
+    }
+
+    /**
      * Bumped each time the user re-enters the app via the tracking notification, so the map
      * can reframe on the active LZ even when the target coordinate itself hasn't changed.
      */
@@ -215,6 +229,7 @@ class AirMedRadarViewModel(application: Application) : AndroidViewModel(applicat
         _searchQuery.value = ""
         _addressSuggestions.value = emptyList()
         sessionToken = AutocompleteSessionToken.newInstance()
+        _dispatchedProvider.value = null
     }
 
     override fun onCleared() {
