@@ -1,7 +1,9 @@
 package com.rf.airmedradar.data
 
+import com.google.android.gms.maps.model.LatLng
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.Transient
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.doubleOrNull
@@ -26,9 +28,11 @@ data class Aircraft(
     @SerialName("alt_geom") val altGeom: Double? = null,
     @SerialName("gs") val groundSpeedKts: Double? = null,
     @SerialName("track") val track: Double? = null,
-    // Not part of the adsb.lol wire format; flags the calibration aircraft ("MOCK911")
-    // so it renders distinctly and is excluded from real-telemetry refresh matching.
-    val isSimulated: Boolean = false,
+    // Not part of the adsb.lol wire format — never present in the response, always attached
+    // client-side by AirMedTrackingService as it tracks each aircraft's position history.
+    // @Transient tells kotlinx.serialization to skip this entirely (LatLng has no
+    // serializer) and always use the default when decoding a payload.
+    @Transient val historyPoints: List<LatLng> = emptyList(),
 ) {
     val displayName: String
         get() = callsign?.trim()?.takeIf { it.isNotBlank() } ?: registration ?: icao
@@ -38,6 +42,9 @@ data class Aircraft(
 
     val hasPosition: Boolean
         get() = lat != null && lon != null
+
+    val currentCoordinates: LatLng?
+        get() = if (lat != null && lon != null) LatLng(lat, lon) else null
 
     // Safe, non-null fallbacks for consumers that structurally require a primitive value
     // (e.g. a Compose Marker's `rotation: Float` param, or flight-path math) rather than

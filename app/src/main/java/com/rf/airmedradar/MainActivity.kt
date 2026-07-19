@@ -68,6 +68,8 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.google.android.gms.maps.CameraUpdateFactory
 import com.google.android.gms.maps.model.BitmapDescriptorFactory
 import com.google.android.gms.maps.model.CameraPosition
+import com.google.android.gms.maps.model.Dash
+import com.google.android.gms.maps.model.Gap
 import com.google.android.gms.maps.model.LatLng
 import com.google.android.gms.maps.model.LatLngBounds
 import com.google.android.gms.maps.model.MapStyleOptions
@@ -77,13 +79,13 @@ import com.google.maps.android.compose.MapProperties
 import com.google.maps.android.compose.MapUiSettings
 import com.google.maps.android.compose.Marker
 import com.google.maps.android.compose.MarkerComposable
+import com.google.maps.android.compose.Polyline
 import com.google.maps.android.compose.rememberCameraPositionState
 import com.google.maps.android.compose.rememberUpdatedMarkerState
 import com.google.android.libraries.places.api.model.AutocompletePrediction
 import com.rf.airmedradar.data.Aircraft
 import com.rf.airmedradar.service.AirMedTrackingService
 import com.rf.airmedradar.service.InterceptStatus
-import com.rf.airmedradar.service.SimulationStatus
 import com.rf.airmedradar.ui.theme.AirMedRadarTheme
 import com.rf.airmedradar.util.formatEtaSeconds
 import com.rf.airmedradar.viewmodel.AirMedRadarViewModel
@@ -144,7 +146,6 @@ fun RadarScreen(viewModel: AirMedRadarViewModel, modifier: Modifier = Modifier) 
     val selectedAircraft by viewModel.selectedAircraft.collectAsStateWithLifecycle()
     val targetCoordinate by viewModel.targetCoordinate.collectAsStateWithLifecycle()
     val interceptStatus by viewModel.interceptStatus.collectAsStateWithLifecycle()
-    val simulationStatus by viewModel.simulationStatus.collectAsStateWithLifecycle()
     val hasLanded by viewModel.hasLanded.collectAsStateWithLifecycle()
     val lzFocusRequestId by viewModel.lzFocusRequestId.collectAsStateWithLifecycle()
     val searchQuery by viewModel.searchQuery.collectAsStateWithLifecycle()
@@ -236,10 +237,9 @@ fun RadarScreen(viewModel: AirMedRadarViewModel, modifier: Modifier = Modifier) 
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(expandedHeight),
-                    aircraftCount = aircraft.count { !it.isSimulated },
+                    aircraftCount = aircraft.size,
                     selectedAircraft = selectedAircraft,
                     interceptStatus = interceptStatus,
-                    simulationStatus = simulationStatus,
                     hasLanded = hasLanded,
                 )
             },
@@ -258,6 +258,10 @@ fun RadarScreen(viewModel: AirMedRadarViewModel, modifier: Modifier = Modifier) 
                 ) {
                     aircraft.forEach { ac ->
                         key(ac.icao) {
+                            AircraftHistoryTrail(aircraft = ac)
+                            targetCoordinate?.let { target ->
+                                DestinationProjectionLine(aircraft = ac, target = target)
+                            }
                             AircraftMarker(
                                 aircraft = ac,
                                 isSelected = ac.icao == selectedAircraft?.icao,
@@ -307,21 +311,13 @@ fun RadarScreen(viewModel: AirMedRadarViewModel, modifier: Modifier = Modifier) 
 
 @Composable
 private fun AircraftMarker(aircraft: Aircraft, isSelected: Boolean, onClick: () -> Unit) {
-    val lat = aircraft.lat ?: return
-    val lon = aircraft.lon ?: return
-    val position = LatLng(lat, lon)
-
+    val position = aircraft.currentCoordinates ?: return
     val markerState = rememberUpdatedMarkerState(position = position)
 
     val altitudeLabel = aircraft.altitudeFeet?.let { "$it ft" } ?: "Alt N/A"
     val speedLabel = aircraft.groundSpeedKts?.let { "${it.toInt()} kt" } ?: "GS N/A"
-    val simulatedSuffix = if (aircraft.isSimulated) " • SIMULATED" else ""
 
-    val hue = when {
-        isSelected -> BitmapDescriptorFactory.HUE_YELLOW
-        aircraft.isSimulated -> BitmapDescriptorFactory.HUE_VIOLET
-        else -> BitmapDescriptorFactory.HUE_AZURE
-    }
+    val hue = if (isSelected) BitmapDescriptorFactory.HUE_YELLOW else BitmapDescriptorFactory.HUE_AZURE
 
     Marker(
         state = markerState,
@@ -331,11 +327,38 @@ private fun AircraftMarker(aircraft: Aircraft, isSelected: Boolean, onClick: () 
         anchor = Offset(0.5f, 0.5f),
         icon = BitmapDescriptorFactory.defaultMarker(hue),
         title = aircraft.displayName,
-        snippet = "$altitudeLabel • $speedLabel$simulatedSuffix",
+        snippet = "$altitudeLabel • $speedLabel",
         onClick = {
             onClick()
             true
         },
+    )
+}
+
+/** Historical position trail: renders once the aircraft has at least two recorded points. */
+@Composable
+private fun AircraftHistoryTrail(aircraft: Aircraft) {
+    if (aircraft.historyPoints.size < 2) return
+    Polyline(
+        points = aircraft.historyPoints,
+        color = Color(0xFFFFC107), // amber — breadcrumb trail
+        width = 4f,
+    )
+}
+
+/**
+ * A dashed straight-line projection from the aircraft's current position to the active LZ —
+ * visually distinct (bright cyan, dashed) from the solid amber breadcrumb trail so the
+ * "where it's been" and "where it's headed" lines are never confused at a glance.
+ */
+@Composable
+private fun DestinationProjectionLine(aircraft: Aircraft, target: LatLng) {
+    val current = aircraft.currentCoordinates ?: return
+    Polyline(
+        points = listOf(current, target),
+        color = Color(0xFF00E5FF), // bright cyan
+        width = 5f,
+        pattern = listOf(Dash(30f), Gap(20f)),
     )
 }
 
@@ -350,9 +373,7 @@ private fun AircraftMarker(aircraft: Aircraft, isSelected: Boolean, onClick: () 
  */
 @Composable
 private fun AircraftEtaLabel(aircraft: Aircraft, targetCoordinate: LatLng?) {
-    val lat = aircraft.lat ?: return
-    val lon = aircraft.lon ?: return
-    val position = LatLng(lat, lon)
+    val position = aircraft.currentCoordinates ?: return
 
     // Aircraft is a data class, so any position/speed/track change from the 3s sim tick or
     // 12s network poll produces a new instance, recomposing this function with fresh text —
@@ -398,12 +419,11 @@ private fun aircraftLabelText(aircraft: Aircraft, targetCoordinate: LatLng?): St
 /** This aircraft's own distance-derived ETA to [target] — independent of the service's
  *  single "closest inbound" tracking, so every marker shows its individual countdown. */
 private fun etaSecondsToTarget(aircraft: Aircraft, target: LatLng): Long {
-    val lat = aircraft.lat ?: return -1L
-    val lon = aircraft.lon ?: return -1L
+    val current = aircraft.currentCoordinates ?: return -1L
     val speed = aircraft.safeGroundSpeedKts
     if (speed <= 1.0) return -1L
     val results = FloatArray(1)
-    Location.distanceBetween(lat, lon, target.latitude, target.longitude, results)
+    Location.distanceBetween(current.latitude, current.longitude, target.latitude, target.longitude, results)
     val distanceNm = results[0] / METERS_PER_NAUTICAL_MILE
     return (distanceNm / speed * 3_600).toLong()
 }
@@ -503,7 +523,6 @@ private fun StatusSheetContent(
     aircraftCount: Int,
     selectedAircraft: Aircraft?,
     interceptStatus: InterceptStatus?,
-    simulationStatus: SimulationStatus?,
     hasLanded: Boolean,
 ) {
     Column(
@@ -516,17 +535,11 @@ private fun StatusSheetContent(
             style = MaterialTheme.typography.titleMedium,
             color = MaterialTheme.colorScheme.onSurface,
         )
-        when {
-            hasLanded -> Text(
+        if (hasLanded) {
+            Text(
                 text = "AIRCRAFT ON SCENE / LANDED",
                 style = MaterialTheme.typography.labelMedium,
                 color = Color(0xFF00C853),
-            )
-            simulationStatus != null -> Text(
-                text = "MOCK911 inbound — ${"%.1f".format(simulationStatus.distanceNm)} nm • " +
-                    "ETA ${formatEtaSeconds(simulationStatus.etaSeconds)}",
-                style = MaterialTheme.typography.labelMedium,
-                color = Color(0xFFFFA000),
             )
         }
         Spacer(Modifier.height(16.dp))

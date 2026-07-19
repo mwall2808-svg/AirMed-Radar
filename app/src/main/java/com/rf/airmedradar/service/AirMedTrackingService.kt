@@ -24,10 +24,6 @@ import com.rf.airmedradar.util.formatEtaSeconds
 import java.io.IOException
 import java.net.SocketTimeoutException
 import java.net.UnknownHostException
-import kotlin.math.asin
-import kotlin.math.atan2
-import kotlin.math.cos
-import kotlin.math.sin
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -42,11 +38,14 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 /**
- * Owns the telemetry engine independent of any Activity/ViewModel lifecycle: ADS-B polling,
- * the MOCK911 calibration simulation, LZ proximity alerting, and the persistent tracking
- * notification. Started in the foreground so the system doesn't throttle the polling loop
- * during long shifts, and bound by [com.rf.airmedradar.viewmodel.AirMedRadarViewModel] so the
- * UI can observe [snapshot] whenever the app is in the foreground.
+ * Owns the telemetry engine independent of any Activity/ViewModel lifecycle: real ADS-B
+ * polling, per-aircraft position-history tracking, LZ proximity alerting, and the persistent
+ * tracking notification. Started in the foreground so the system doesn't throttle the polling
+ * loop during long shifts, and bound by [com.rf.airmedradar.viewmodel.AirMedRadarViewModel] so
+ * the UI can observe [snapshot] whenever the app is in the foreground.
+ *
+ * Every aircraft in [snapshot] reflects verified incoming adsb.lol telemetry only — there is
+ * no simulated/synthetic traffic in this engine.
  */
 class AirMedTrackingService : Service() {
 
@@ -63,30 +62,35 @@ class AirMedTrackingService : Service() {
     private val repository = AdsbRepository()
 
     private val _liveAircraft = MutableStateFlow<List<Aircraft>>(emptyList())
-    private val _mockAircraft = MutableStateFlow(createMockAircraft())
     private val _isOffline = MutableStateFlow(false)
     private val _targetCoordinate = MutableStateFlow<LatLng?>(null)
     private val _interceptStatus = MutableStateFlow<InterceptStatus?>(null)
-    private val _simulationStatus = MutableStateFlow<SimulationStatus?>(null)
     private val _hasLanded = MutableStateFlow(false)
 
-    private val combinedAircraft = combine(_liveAircraft, _mockAircraft) { live, mock -> live + mock }
-    private val engineGroupA = combine(combinedAircraft, _isOffline, _targetCoordinate) { a, o, t -> Triple(a, o, t) }
-    private val engineGroupB = combine(_interceptStatus, _simulationStatus, _hasLanded) { i, s, l -> Triple(i, s, l) }
-
     /** Single source of truth for the UI — everything it needs to render in one flow. */
-    val snapshot: StateFlow<TrackingSnapshot> = combine(engineGroupA, engineGroupB) { groupA, groupB ->
-        val (aircraft, isOffline, target) = groupA
-        val (intercept, simulation, landed) = groupB
+    val snapshot: StateFlow<TrackingSnapshot> = combine(
+        _liveAircraft,
+        _isOffline,
+        _targetCoordinate,
+        _interceptStatus,
+        _hasLanded,
+    ) { aircraft, isOffline, target, intercept, landed ->
         TrackingSnapshot(
             aircraft = aircraft,
             isOffline = isOffline,
             targetCoordinate = target,
             interceptStatus = intercept,
-            simulationStatus = simulation,
             hasLanded = landed,
         )
     }.stateIn(serviceScope, SharingStarted.Eagerly, TrackingSnapshot())
+
+    /**
+     * Running position trail per aircraft (icao -> immutable point list), used to attach
+     * [Aircraft.historyPoints] on each poll. Internal bookkeeping only — never published
+     * directly; every list handed to the UI via [_liveAircraft] is a freshly built copy so
+     * Compose/StateFlow always see a genuinely new instance and recompose the Polyline.
+     */
+    private val aircraftHistory = mutableMapOf<String, List<LatLng>>()
 
     /** Last computed distance-to-target per real aircraft, used to derive the closing trend. */
     private val previousTargetDistanceNm = mutableMapOf<String, Double>()
@@ -99,7 +103,6 @@ class AirMedTrackingService : Service() {
         createNotificationChannels()
         startForeground(TRACKING_NOTIFICATION_ID, buildTrackingNotification())
         startPollingLoop()
-        startSimulationLoop()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
@@ -125,11 +128,9 @@ class AirMedTrackingService : Service() {
     fun clearTarget() {
         _targetCoordinate.value = null
         _interceptStatus.value = null
-        _simulationStatus.value = null
         _hasLanded.value = false
         hasFiredInboundAlert = false
         previousTargetDistanceNm.clear()
-        _mockAircraft.value = createMockAircraft()
         postNotificationSafely(TRACKING_NOTIFICATION_ID, buildTrackingNotification())
     }
 
@@ -139,16 +140,6 @@ class AirMedTrackingService : Service() {
                 refreshAircraft()
                 tick()
                 delay(POLL_INTERVAL_MS)
-            }
-        }
-    }
-
-    private fun startSimulationLoop() {
-        serviceScope.launch {
-            while (isActive) {
-                advanceMockAircraft()
-                tick()
-                delay(SIMULATION_TICK_MS)
             }
         }
     }
@@ -171,9 +162,10 @@ class AirMedTrackingService : Service() {
                 radiusNm = TRACKING_RADIUS_NM,
             )
             val rotorcraft = fetched.filter { it.hasPosition && it.isRotorcraft() }
-            _liveAircraft.value = rotorcraft
+            val withHistory = attachHistory(rotorcraft)
+            _liveAircraft.value = withHistory
             _isOffline.value = false
-            updateInterceptStatus(rotorcraft)
+            updateInterceptStatus(withHistory)
         } catch (e: UnknownHostException) {
             Log.w(TAG, "adsb.lol unreachable (no DNS/connectivity) — retaining last known positions", e)
             _isOffline.value = true
@@ -188,6 +180,36 @@ class AirMedTrackingService : Service() {
             // down a foreground service running unattended for an entire shift.
             Log.e(TAG, "Unexpected error refreshing aircraft telemetry", e)
             _isOffline.value = true
+        }
+    }
+
+    /**
+     * Appends each aircraft's current position to its running trail and returns a freshly
+     * built [Aircraft] list, each entry carrying its own new [Aircraft.historyPoints] list.
+     * Deliberately never mutates a previously-published list in place: `toMutableList().apply
+     * { add(...) }.toList()` always produces a distinct instance, which is what lets
+     * StateFlow/Compose detect the change and redraw the Polyline — appending to the same
+     * list reference in place would leave `_liveAircraft.value` structurally unchanged and
+     * silently skip recomposition.
+     */
+    private fun attachHistory(rotorcraft: List<Aircraft>): List<Aircraft> {
+        val activeIcaos = rotorcraft.map { it.icao }.toSet()
+        aircraftHistory.keys.retainAll(activeIcaos)
+
+        return rotorcraft.map { ac ->
+            val lat = ac.lat
+            val lon = ac.lon
+            if (lat == null || lon == null) return@map ac
+
+            val currentTrail = aircraftHistory[ac.icao] ?: emptyList()
+            val updatedTrail = currentTrail.toMutableList().apply { add(LatLng(lat, lon)) }.toList()
+            val trimmedTrail = if (updatedTrail.size > MAX_TRAIL_POINTS) {
+                updatedTrail.takeLast(MAX_TRAIL_POINTS)
+            } else {
+                updatedTrail
+            }
+            aircraftHistory[ac.icao] = trimmedTrail
+            ac.copy(historyPoints = trimmedTrail)
         }
     }
 
@@ -208,50 +230,9 @@ class AirMedTrackingService : Service() {
         }.minByOrNull { it.distanceNm }
     }
 
-    /** Advances MOCK911 one tick along a great-circle course toward the active target, if any. */
-    private fun advanceMockAircraft() {
-        val target = _targetCoordinate.value
-        val current = _mockAircraft.value
-        val lat = current.lat ?: OPERATIONAL_CENTER_LAT
-        val lon = current.lon ?: OPERATIONAL_CENTER_LON
-
-        if (target == null) {
-            _simulationStatus.value = null
-            return
-        }
-
-        val distanceNm = distanceNauticalMiles(lat, lon, target.latitude, target.longitude)
-        if (distanceNm <= LANDING_THRESHOLD_NM) {
-            _mockAircraft.value = current.copy(
-                lat = target.latitude,
-                lon = target.longitude,
-                groundSpeedKts = 0.0,
-            )
-            _simulationStatus.value = SimulationStatus(distanceNm = 0.0, etaSeconds = 0L)
-            return
-        }
-
-        val bearingDeg = initialBearingDegrees(lat, lon, target.latitude, target.longitude)
-        val tickHours = SIMULATION_TICK_MS / 3_600_000.0
-        val travelNm = MOCK_GROUND_SPEED_KTS * tickHours
-        val (newLat, newLon) = destinationPoint(lat, lon, bearingDeg, travelNm)
-
-        _mockAircraft.value = current.copy(
-            lat = newLat,
-            lon = newLon,
-            track = bearingDeg,
-            groundSpeedKts = MOCK_GROUND_SPEED_KTS,
-            altGeom = MOCK_ALTITUDE_FEET,
-        )
-
-        val remainingNm = (distanceNm - travelNm).coerceAtLeast(0.0)
-        val etaSeconds = (remainingNm / MOCK_GROUND_SPEED_KTS * 3_600).toLong()
-        _simulationStatus.value = SimulationStatus(distanceNm = distanceNm, etaSeconds = etaSeconds)
-    }
-
     /**
-     * Recomputes the single nearest inbound aircraft (real or simulated) relative to the
-     * target, evaluates proximity alerts against it, and refreshes the tracking notification.
+     * Recomputes the single nearest inbound aircraft relative to the target, evaluates
+     * proximity alerts against it, and refreshes the tracking notification.
      */
     private fun tick() {
         val closest = computeClosestInbound()
@@ -260,22 +241,9 @@ class AirMedTrackingService : Service() {
     }
 
     private fun computeClosestInbound(): ClosestInbound? {
-        val target = _targetCoordinate.value ?: return null
-        val candidates = buildList {
-            _interceptStatus.value?.let { status ->
-                add(ClosestInbound(status.aircraft.displayName, status.distanceNm, estimateEtaSeconds(status)))
-            }
-            _mockAircraft.value.let { mock ->
-                val lat = mock.lat
-                val lon = mock.lon
-                if (lat != null && lon != null) {
-                    val distanceNm = distanceNauticalMiles(lat, lon, target.latitude, target.longitude)
-                    val eta = _simulationStatus.value?.etaSeconds ?: UNKNOWN_ETA_SECONDS
-                    add(ClosestInbound(mock.displayName, distanceNm, eta))
-                }
-            }
-        }
-        return candidates.minByOrNull { it.distanceNm }
+        if (_targetCoordinate.value == null) return null
+        val status = _interceptStatus.value ?: return null
+        return ClosestInbound(status.aircraft.displayName, status.distanceNm, estimateEtaSeconds(status))
     }
 
     private fun estimateEtaSeconds(status: InterceptStatus): Long {
@@ -390,46 +358,6 @@ class AirMedTrackingService : Service() {
         return results[0] / METERS_PER_NAUTICAL_MILE
     }
 
-    private fun initialBearingDegrees(lat1: Double, lon1: Double, lat2: Double, lon2: Double): Double {
-        val phi1 = Math.toRadians(lat1)
-        val phi2 = Math.toRadians(lat2)
-        val deltaLambda = Math.toRadians(lon2 - lon1)
-        val y = sin(deltaLambda) * cos(phi2)
-        val x = cos(phi1) * sin(phi2) - sin(phi1) * cos(phi2) * cos(deltaLambda)
-        return (Math.toDegrees(atan2(y, x)) + 360.0) % 360.0
-    }
-
-    private fun destinationPoint(
-        lat: Double,
-        lon: Double,
-        bearingDeg: Double,
-        distanceNm: Double,
-    ): Pair<Double, Double> {
-        val angularDistance = (distanceNm * METERS_PER_NAUTICAL_MILE) / EARTH_RADIUS_METERS
-        val bearingRad = Math.toRadians(bearingDeg)
-        val phi1 = Math.toRadians(lat)
-        val lambda1 = Math.toRadians(lon)
-        val phi2 = asin(sin(phi1) * cos(angularDistance) + cos(phi1) * sin(angularDistance) * cos(bearingRad))
-        val lambda2 = lambda1 + atan2(
-            sin(bearingRad) * sin(angularDistance) * cos(phi1),
-            cos(angularDistance) - sin(phi1) * sin(phi2),
-        )
-        return Math.toDegrees(phi2) to Math.toDegrees(lambda2)
-    }
-
-    private fun createMockAircraft() = Aircraft(
-        icao = "MOCK911",
-        callsign = "MOCK911",
-        registration = "N911HN",
-        category = "A7",
-        lat = OPERATIONAL_CENTER_LAT,
-        lon = OPERATIONAL_CENTER_LON,
-        altGeom = MOCK_ALTITUDE_FEET,
-        groundSpeedKts = 0.0,
-        track = 0.0,
-        isSimulated = true,
-    )
-
     private data class ClosestInbound(val label: String, val distanceNm: Double, val etaSeconds: Long)
 
     companion object {
@@ -446,13 +374,12 @@ class AirMedTrackingService : Service() {
         private const val OPERATIONAL_CENTER_LON = -84.9
         private const val TRACKING_RADIUS_NM = 75
         private const val POLL_INTERVAL_MS = 12_000L
-        private const val SIMULATION_TICK_MS = 3_000L
         private const val METERS_PER_NAUTICAL_MILE = 1852.0
-        private const val EARTH_RADIUS_METERS = 6_371_000.0
-        private const val MOCK_GROUND_SPEED_KTS = 140.0
-        private const val MOCK_ALTITUDE_FEET = 1_500.0
         private const val LANDING_THRESHOLD_NM = 0.3
         private const val INBOUND_ALERT_THRESHOLD_NM = 5.0
         private const val UNKNOWN_ETA_SECONDS = -1L
+
+        /** Trail cap per aircraft (~10 min of history at the 12s poll interval). */
+        private const val MAX_TRAIL_POINTS = 50
     }
 }

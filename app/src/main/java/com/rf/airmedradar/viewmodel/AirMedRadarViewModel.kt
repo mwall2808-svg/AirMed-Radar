@@ -17,7 +17,6 @@ import com.rf.airmedradar.data.Aircraft
 import com.rf.airmedradar.data.PlacesAutocompleteRepository
 import com.rf.airmedradar.service.AirMedTrackingService
 import com.rf.airmedradar.service.InterceptStatus
-import com.rf.airmedradar.service.SimulationStatus
 import com.rf.airmedradar.service.TrackingSnapshot
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.FlowPreview
@@ -74,8 +73,6 @@ class AirMedRadarViewModel(application: Application) : AndroidViewModel(applicat
         snapshot.map { it.targetCoordinate }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
     val interceptStatus: StateFlow<InterceptStatus?> =
         snapshot.map { it.interceptStatus }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
-    val simulationStatus: StateFlow<SimulationStatus?> =
-        snapshot.map { it.simulationStatus }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
     val hasLanded: StateFlow<Boolean> =
         snapshot.map { it.hasLanded }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), false)
 
