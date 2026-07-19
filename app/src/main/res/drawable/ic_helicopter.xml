@@ -3,24 +3,25 @@
     android:height="24dp"
     android:viewportWidth="24"
     android:viewportHeight="24">
-    <!-- Main rotor blade -->
-    <path
-        android:fillColor="#FFFFFFFF"
-        android:pathData="M2,3.4L22,3.4L22,4.6L2,4.6Z" />
-    <!-- Rotor hub -->
-    <path
-        android:fillColor="#FFFFFFFF"
-        android:pathData="M11,4A1,1 0 1,0 13,4A1,1 0 1,0 11,4Z" />
     <!-- Fuselage (nose points up = 0 deg heading, matching track bearing convention) -->
     <path
         android:fillColor="#FFFFFFFF"
-        android:pathData="M9.5,7.5A2.5,2.5 0 0,1 14.5,7.5L14.5,12.5A2.5,2.5 0 0,1 9.5,12.5Z" />
+        android:pathData="M9.3,8.7A2.7,2.7 0 0,1 14.7,8.7L14.7,14.3A2.7,2.7 0 0,1 9.3,14.3Z" />
     <!-- Tail boom -->
     <path
         android:fillColor="#FFFFFFFF"
-        android:pathData="M11.5,12.5L12.5,12.5L12.5,21L11.5,21Z" />
+        android:pathData="M11.4,14.3L12.6,14.3L12.6,21.5L11.4,21.5Z" />
     <!-- Tail rotor -->
     <path
         android:fillColor="#FFFFFFFF"
-        android:pathData="M10,20.5L14,20.5L14,21.5L10,21.5Z" />
+        android:pathData="M10,21L14,21L14,22L10,22Z" />
+    <!-- Main rotor blade: tapered, centered on the rotor mast over the fuselage (not
+         floating above the nose) so it reads as blades mounted on the body. -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M1,9L4.5,8.6L19.5,8.6L23,9L19.5,9.4L4.5,9.4Z" />
+    <!-- Rotor hub, drawn on top of the blade at the mast point -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M10.9,9A1.1,1.1 0 1,0 13.1,9A1.1,1.1 0 1,0 10.9,9Z" />
 </vector>
