@@ -10,7 +10,8 @@
   .\driver.ps1 build
   .\driver.ps1 install
   .\driver.ps1 launch
-  .\driver.ps1 tap 675 312
+  .\driver.ps1 tapon "Recenter on operational area"   # find + tap by content-desc, no coord guessing
+  .\driver.ps1 find "Clear target"                    # just print bounds/center, don't tap
   .\driver.ps1 type "10444 Cole Ln Aurora IN"
   .\driver.ps1 screenshot smoke_1
   .\driver.ps1 crashcheck
@@ -19,7 +20,7 @@
 param(
     [Parameter(Mandatory = $true, Position = 0)]
     [ValidateSet("devices", "build", "install", "launch", "stop", "tap", "type", "key", "back",
-        "screenshot", "logcat", "crashcheck", "notifications", "full-smoke")]
+        "screenshot", "logcat", "crashcheck", "notifications", "find", "tapon", "full-smoke")]
     [string]$Action,
 
     [Parameter(Position = 1, ValueFromRemainingArguments = $true)]
@@ -47,6 +48,23 @@ function Get-TargetDevice([string]$Adb) {
     $lines = & $Adb devices | Select-String "`tdevice$"
     if (-not $lines) { throw "No connected device/emulator found. Run '.\driver.ps1 devices' first." }
     return ($lines[0].ToString().Split("`t")[0])
+}
+
+function Find-UiNode([string]$Adb, [string]$Dev, [string]$Query) {
+    $remote = "/sdcard/ui_dump.xml"
+    $local = Join-Path $env:TEMP "airmedradar_ui_dump.xml"
+    & $Adb -s $Dev shell uiautomator dump $remote | Out-Null
+    & $Adb -s $Dev pull $remote $local | Out-Null
+    [xml]$xml = Get-Content $local
+    # NOT named $matches: that's PowerShell's own automatic variable (populated by the
+    # -match operator) and colliding with it causes intermittent, hard-to-repro failures
+    # on repeated calls within the same session — the same class of bug as $pid below.
+    $foundNodes = $xml.SelectNodes("//node") | Where-Object {
+        $_.'content-desc' -like "*$Query*" -or $_.text -like "*$Query*"
+    }
+    # Force array semantics: PowerShell unwraps a single-match result to a bare
+    # XmlElement, which breaks [0] indexing and .Count downstream.
+    return @($foundNodes)
 }
 
 $adb = Get-AdbPath
@@ -143,6 +161,38 @@ switch ($Action) {
         & $adb -s $dev pull /sdcard/notifications.png $local
         & $adb -s $dev shell cmd statusbar collapse
         Write-Output "Saved: $local"
+    }
+
+    "find" {
+        if ($Rest.Count -lt 1) { throw "Usage: find <content-desc or text substring, case-sensitive>" }
+        $dev = Get-TargetDevice $adb
+        $nodes = Find-UiNode $adb $dev $Rest[0]
+        if (-not $nodes -or $nodes.Count -eq 0) { Write-Output "No match for '$($Rest[0])'."; break }
+        foreach ($n in $nodes) {
+            $b = $n.bounds -replace '[\[\]]', ',' -split ',' | Where-Object { $_ -ne '' }
+            $cx = [int](([int]$b[0] + [int]$b[2]) / 2)
+            $cy = [int](([int]$b[1] + [int]$b[3]) / 2)
+            Write-Output "desc='$($n.'content-desc')' text='$($n.text)' bounds=$($n.bounds) center=$cx,$cy clickable=$($n.clickable)"
+        }
+    }
+
+    "tapon" {
+        if ($Rest.Count -lt 1) { throw "Usage: tapon <content-desc or text substring> (taps the first match's center)" }
+        $dev = Get-TargetDevice $adb
+        $nodes = Find-UiNode $adb $dev $Rest[0]
+        if (-not $nodes -or $nodes.Count -eq 0) { throw "No match for '$($Rest[0])' — nothing to tap." }
+        # Deliberately a foreach + break rather than $nodes[0] — indexing into the array
+        # returned across this function boundary was intermittently unreliable in testing
+        # (PowerShell unwrapping/rewrapping single-element arrays across a return boundary);
+        # iterate-and-break matches the proven-reliable pattern used by the `find` action.
+        foreach ($n in $nodes) {
+            $b = $n.bounds -replace '[\[\]]', ',' -split ',' | Where-Object { $_ -ne '' }
+            $cx = [int](([int]$b[0] + [int]$b[2]) / 2)
+            $cy = [int](([int]$b[1] + [int]$b[3]) / 2)
+            & $adb -s $dev shell input tap $cx $cy
+            Write-Output "Tapped '$($Rest[0])' at $cx,$cy (bounds=$($n.bounds))"
+            break
+        }
     }
 
     "full-smoke" {

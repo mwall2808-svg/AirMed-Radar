@@ -59,20 +59,23 @@ For a one-shot build+install+launch+screenshot+crash-check:
 | `logcat` | Dumps the last 200 lines of the full log. |
 | `crashcheck` | Dumps the crash-buffer (`logcat -b crash`) and reports whether the process is still alive. **This is the primary regression check** — run it after any interaction. |
 | `notifications` | Expands the notification shade, screenshots it to `out/notifications.png`, collapses it. Used to verify the foreground-service tracking notification and HEMS alert channel. |
+| `find <substring>` | Dumps the accessibility tree (`uiautomator dump`) and prints bounds/center for every node whose `content-desc` or `text` contains the substring. **The reliable way to get tap coordinates** — see Gotchas. |
+| `tapon <substring>` | `find` + tap the first match's center in one step. E.g. `tapon "Recenter on operational area"` taps the FAB without any coordinate guessing. |
 | `full-smoke` | `build` → `install` → `launch` → `screenshot` → `crashcheck` in sequence. |
 
 **A representative interaction** (search → autocomplete → select → verify), exactly as run to validate this app:
 
 ```powershell
 .\.claude\skills\run-airmedradar\driver.ps1 launch
-.\.claude\skills\run-airmedradar\driver.ps1 tap 675 312          # focus the top search bar
+.\.claude\skills\run-airmedradar\driver.ps1 tapon "Search"           # focus the top search bar (by content-desc)
 Start-Sleep -Seconds 1
 .\.claude\skills\run-airmedradar\driver.ps1 type "10444 Cole Ln Aurora IN"
 Start-Sleep -Seconds 2
 .\.claude\skills\run-airmedradar\driver.ps1 screenshot suggestions   # confirm the Places dropdown appeared
-.\.claude\skills\run-airmedradar\driver.ps1 tap 675 495          # tap the first suggestion
+.\.claude\skills\run-airmedradar\driver.ps1 tap 672 536              # suggestion rows have no content-desc — use find to get bounds, or tap by screenshot coords
 Start-Sleep -Seconds 3
 .\.claude\skills\run-airmedradar\driver.ps1 screenshot lz_dropped    # confirm the amber LZ pin + camera reframe
+.\.claude\skills\run-airmedradar\driver.ps1 tapon "Recenter on operational area"
 .\.claude\skills\run-airmedradar\driver.ps1 crashcheck
 ```
 
@@ -94,7 +97,10 @@ No test suite exists yet in this project (only the stock `ExampleUnitTest`/`Exam
 
 ## Gotchas
 
-- **`adb shell input tap` coordinates are raw device pixels, not the `dp` values Compose uses, and not the resized coordinates a screenshot viewer shows you.** This physical test device is 1344×2992 px but screenshots often display scaled down (e.g. 898×2000) — multiply displayed coordinates by the scale factor (here 1.5×) to get real tap coordinates. Get it wrong and you tap the wrong UI element with no error — you just won't see the effect you expected.
+- **Don't eyeball tap coordinates from a screenshot — use `find`/`tapon` instead.** Every Compose clickable in this app that matters for driving it (search bar, clear button, FAB, drag handle) has an explicit `contentDescription`, which shows up as `content-desc` in `adb shell uiautomator dump`. `.\driver.ps1 tapon "Recenter on operational area"` gets the exact center from the accessibility tree — no scale-factor math, no squinting at a downscaled preview. An entire session of manual pixel-hunting (repeatedly mis-locating a small icon, off by 600px on the FAB at one point) was resolved instantly once this was used instead. Reserve manual screenshot-coordinate tapping for things with no semantic label (e.g. a specific point on the map itself).
+- **`adb shell input tap` coordinates are raw device pixels, not the `dp` values Compose uses, and not the resized coordinates a screenshot viewer shows you.** This physical test device is 1344×2992 px but screenshots often display scaled down (e.g. 898×2000) — multiply displayed coordinates by the scale factor (here 1.5×) to get real tap coordinates. Get it wrong and you tap the wrong UI element with no error — you just won't see the effect you expected. (This is exactly the class of error `find`/`tapon` sidesteps.)
+- **The device screen locks from inactivity during a long session** — if `find`/`tapon` suddenly report "No match" for something that was matching moments ago, check a screenshot before assuming it's a real bug; you may just be looking at the lock screen. `adb shell input keyevent KEYCODE_WAKEUP` then swipe up to unlock.
+- **PowerShell has more reserved automatic variable names than just `$pid`** — `$matches` (populated by the `-match` operator) is another one. Naming a local variable `$matches` in a function that's called repeatedly in the same session produced intermittent, hard-to-reproduce failures where indexing into the "same" data sometimes worked and sometimes didn't. If a PowerShell function behaves inconsistently across repeated calls with no apparent state change, suspect a collision with an automatic variable (`$_`, `$args`, `$input`, `$matches`, `$pid`, `$error`, etc.) before assuming an XML/array parsing bug.
 - **`adb shell input text` requires literal spaces to be encoded as `%s`.** The driver handles this automatically (`type` action) — don't call `adb shell input text` directly with spaces, it silently truncates at the first space.
 - **`MarkerComposable`'s on-map labels can go visually stale** if the underlying maps-compose version doesn't reliably re-bake the marker bitmap on content-only recomposition (see `MainActivity.kt`'s `AircraftEtaLabel` — it's keyed on the label text for exactly this reason). If you're screenshotting a moving-aircraft label and it looks frozen, that's a real class of bug here, not a screenshot timing fluke — check it's actually keyed correctly, don't just assume the screenshot was too early.
 - **`$pid` is a read-only automatic variable in PowerShell.** Don't name a variable `$pid` in scripts targeting this app (or any PowerShell script) — assignment throws `Cannot overwrite variable PID because it is read-only or constant`. Use `$appPid` or similar.
@@ -110,3 +116,5 @@ No test suite exists yet in this project (only the stock `ExampleUnitTest`/`Exam
 - **`You cannot call a method on a null-valued expression` after `stop` then `crashcheck`/`launch`**: `pidof` returned null because the process really isn't running. Guard the `.Trim()` call — see driver.ps1's `Get-TargetDevice`-adjacent pidof handling for the pattern.
 - **`No connected device/emulator found`**: run `.\driver.ps1 devices` — if empty, start an emulator or reconnect/re-authorize the physical device (check for an "Allow USB debugging" prompt on the device itself).
 - **App installs but `launch` throws "App did not stay running"**: run `.\driver.ps1 crashcheck` immediately — it dumps the crash-buffer log, which will show the actual exception (this is how a real init-order `NullPointerException` in the ViewModel was caught and fixed during development).
+- **`Cannot index into a null array` from `tapon`, intermittently, even though `find` with the identical query just worked**: check for a PowerShell automatic-variable collision (see the `$matches` Gotcha above) before assuming the XML/bounds parsing is wrong — the parsing logic can test perfectly in isolation and still fail unpredictably when called as a function repeatedly in one session if it shadows a reserved name.
+- **`find`/`tapon` suddenly report no match for something on-screen a moment ago**: take a screenshot before debugging further — the physical device's screen may have locked from inactivity. Wake and unlock it (`input keyevent KEYCODE_WAKEUP` + swipe up) rather than assuming the app or driver broke.
