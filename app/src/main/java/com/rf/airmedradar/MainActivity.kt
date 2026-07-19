@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.location.Location
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -27,6 +28,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.MyLocation
@@ -58,7 +60,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.google.android.gms.maps.CameraUpdateFactory
@@ -72,6 +76,7 @@ import com.google.maps.android.compose.GoogleMap
 import com.google.maps.android.compose.MapProperties
 import com.google.maps.android.compose.MapUiSettings
 import com.google.maps.android.compose.Marker
+import com.google.maps.android.compose.MarkerComposable
 import com.google.maps.android.compose.rememberCameraPositionState
 import com.google.maps.android.compose.rememberUpdatedMarkerState
 import com.google.android.libraries.places.api.model.AutocompletePrediction
@@ -88,6 +93,7 @@ private const val OPERATIONAL_LAT = 39.0
 private const val OPERATIONAL_LON = -84.9
 private const val OPERATIONAL_ZOOM = 9.5f
 private const val CAMERA_ANIMATION_DURATION_MS = 800
+private const val METERS_PER_NAUTICAL_MILE = 1852.0
 
 class MainActivity : ComponentActivity() {
 
@@ -257,6 +263,7 @@ fun RadarScreen(viewModel: AirMedRadarViewModel, modifier: Modifier = Modifier) 
                                 isSelected = ac.icao == selectedAircraft?.icao,
                                 onClick = { viewModel.selectAircraft(ac) },
                             )
+                            AircraftEtaLabel(aircraft = ac, targetCoordinate = targetCoordinate)
                         }
                     }
                     targetCoordinate?.let { target ->
@@ -330,6 +337,70 @@ private fun AircraftMarker(aircraft: Aircraft, isSelected: Boolean, onClick: () 
             true
         },
     )
+}
+
+/**
+ * A small always-visible telemetry tag anchored just beneath the aircraft icon: the live
+ * ETA to the active LZ when a target is set, otherwise groundspeed/altitude. Rendered as a
+ * second marker sibling (not merged into the icon's own bitmap) specifically so it can stay
+ * upright on screen — `flat = false` billboards it regardless of map bearing/tilt, whereas
+ * the icon marker uses `flat = true` so its rotation tracks true heading correctly as the
+ * map itself rotates. Baking both into one rotated bitmap would tilt the text unreadable
+ * whenever the dispatcher rotates the map.
+ */
+@Composable
+private fun AircraftEtaLabel(aircraft: Aircraft, targetCoordinate: LatLng?) {
+    val lat = aircraft.lat ?: return
+    val lon = aircraft.lon ?: return
+    val position = LatLng(lat, lon)
+    val markerState = rememberUpdatedMarkerState(position = position)
+
+    // Aircraft is a data class, so any position/speed/track change from the 3s sim tick or
+    // 12s network poll produces a new instance — Compose recomposes this label automatically.
+    val labelText = aircraftLabelText(aircraft, targetCoordinate)
+
+    MarkerComposable(
+        state = markerState,
+        anchor = Offset(0.5f, 0f),
+        flat = false,
+        zIndex = 1f,
+    ) {
+        Text(
+            text = labelText,
+            color = Color.White,
+            fontSize = 10.sp,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier
+                .padding(top = 22.dp) // clears the icon graphic above before the pill starts
+                .background(Color.Black.copy(alpha = 0.78f), RoundedCornerShape(4.dp))
+                .padding(horizontal = 5.dp, vertical = 1.dp),
+        )
+    }
+}
+
+private fun aircraftLabelText(aircraft: Aircraft, targetCoordinate: LatLng?): String {
+    if (targetCoordinate != null) {
+        val etaSeconds = etaSecondsToTarget(aircraft, targetCoordinate)
+        return "ETA ${formatEtaSeconds(etaSeconds)}"
+    }
+    val speedText = aircraft.groundSpeedKts?.let { "${it.toInt()}KT" } ?: "—KT"
+    val altText = aircraft.altitudeFeet?.let { feet ->
+        if (feet >= 1000) "${"%.1f".format(feet / 1000.0)}K FT" else "$feet FT"
+    } ?: "—FT"
+    return "$speedText / $altText"
+}
+
+/** This aircraft's own distance-derived ETA to [target] — independent of the service's
+ *  single "closest inbound" tracking, so every marker shows its individual countdown. */
+private fun etaSecondsToTarget(aircraft: Aircraft, target: LatLng): Long {
+    val lat = aircraft.lat ?: return -1L
+    val lon = aircraft.lon ?: return -1L
+    val speed = aircraft.safeGroundSpeedKts
+    if (speed <= 1.0) return -1L
+    val results = FloatArray(1)
+    Location.distanceBetween(lat, lon, target.latitude, target.longitude, results)
+    val distanceNm = results[0] / METERS_PER_NAUTICAL_MILE
+    return (distanceNm / speed * 3_600).toLong()
 }
 
 /** The searched intercept point: a highly visible amber landing-zone pin + reticle. */
