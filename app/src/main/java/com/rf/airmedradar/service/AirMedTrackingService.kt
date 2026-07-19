@@ -17,9 +17,11 @@ import com.rf.airmedradar.MainActivity
 import com.rf.airmedradar.R
 import com.rf.airmedradar.data.AdsbRepository
 import com.rf.airmedradar.data.Aircraft
+import com.rf.airmedradar.data.DiscoveredHemsProvider
 import com.rf.airmedradar.data.GeocodingService
 import com.rf.airmedradar.data.LocationRepository
 import com.rf.airmedradar.data.NetworkUtils
+import com.rf.airmedradar.data.discoverHemsProviders
 import com.rf.airmedradar.data.isRotorcraft
 import com.rf.airmedradar.util.formatEtaSeconds
 import java.io.IOException
@@ -70,6 +72,7 @@ class AirMedTrackingService : Service() {
     private val _interceptStatus = MutableStateFlow<InterceptStatus?>(null)
     private val _hasLanded = MutableStateFlow(false)
     private val _deviceLocation = MutableStateFlow<LatLng?>(null)
+    private val _discoveredProviders = MutableStateFlow<List<DiscoveredHemsProvider>>(emptyList())
 
     private val telemetrySnapshot: StateFlow<TrackingSnapshot> = combine(
         _liveAircraft,
@@ -88,8 +91,12 @@ class AirMedTrackingService : Service() {
     }.stateIn(serviceScope, SharingStarted.Eagerly, TrackingSnapshot())
 
     /** Single source of truth for the UI — everything it needs to render in one flow. */
-    val snapshot: StateFlow<TrackingSnapshot> = combine(telemetrySnapshot, _deviceLocation) { base, location ->
-        base.copy(deviceLocation = location)
+    val snapshot: StateFlow<TrackingSnapshot> = combine(
+        telemetrySnapshot,
+        _deviceLocation,
+        _discoveredProviders,
+    ) { base, location, providers ->
+        base.copy(deviceLocation = location, discoveredProviders = providers)
     }.stateIn(serviceScope, SharingStarted.Eagerly, TrackingSnapshot())
 
     /**
@@ -189,6 +196,7 @@ class AirMedTrackingService : Service() {
         _targetCoordinate.value = null
         _interceptStatus.value = null
         _hasLanded.value = false
+        _discoveredProviders.value = emptyList()
     }
 
     /**
@@ -213,6 +221,10 @@ class AirMedTrackingService : Service() {
             _liveAircraft.value = withHistory
             _isOffline.value = false
             updateInterceptStatus(withHistory)
+            // Runs against the full bounding-box batch, not just `rotorcraft` above — ICAO
+            // type-code discovery is an independent classification from the isRotorcraft()
+            // category/callsign heuristic and shouldn't be narrowed by it.
+            _discoveredProviders.value = discoverHemsProviders(fetched)
         } catch (e: UnknownHostException) {
             Log.w(TAG, "adsb.lol unreachable (no DNS/connectivity) — retaining last known positions", e)
             _isOffline.value = true

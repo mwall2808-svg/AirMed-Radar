@@ -14,6 +14,7 @@ import com.google.android.libraries.places.api.Places
 import com.google.android.libraries.places.api.model.AutocompletePrediction
 import com.google.android.libraries.places.api.model.AutocompleteSessionToken
 import com.rf.airmedradar.data.Aircraft
+import com.rf.airmedradar.data.DiscoveredHemsProvider
 import com.rf.airmedradar.data.PlacesAutocompleteRepository
 import com.rf.airmedradar.data.WeatherRepository
 import com.rf.airmedradar.service.AirMedTrackingService
@@ -89,6 +90,11 @@ class AirMedRadarViewModel(application: Application) : AndroidViewModel(applicat
      *  republished here purely so the UI can snap its camera to it and bias Places search. */
     val deviceLocation: StateFlow<LatLng?> =
         snapshot.map { it.deviceLocation }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
+    /** HEMS operators identified live from the current poll's telemetry — see
+     *  [com.rf.airmedradar.data.discoverHemsProviders]. Reflects "who's airborne right now,"
+     *  not a fixed registry, so it can shrink back to empty between polls. */
+    val discoveredProviders: StateFlow<List<DiscoveredHemsProvider>> =
+        snapshot.map { it.discoveredProviders }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
     private val _selectedAircraft = MutableStateFlow<Aircraft?>(null)
     val selectedAircraft: StateFlow<Aircraft?> = _selectedAircraft.asStateFlow()
