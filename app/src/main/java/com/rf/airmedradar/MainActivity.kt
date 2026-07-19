@@ -31,8 +31,10 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -41,6 +43,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.MyLocation
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.BottomSheetScaffold
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FloatingActionButton
@@ -48,6 +51,8 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.SearchBar
 import androidx.compose.material3.SearchBarDefaults
 import androidx.compose.material3.SheetValue
@@ -99,6 +104,7 @@ import com.google.maps.android.compose.rememberCameraPositionState
 import com.google.maps.android.compose.rememberUpdatedMarkerState
 import com.google.android.libraries.places.api.model.AutocompletePrediction
 import com.rf.airmedradar.data.Aircraft
+import com.rf.airmedradar.data.profile.UserProfile
 import com.rf.airmedradar.service.AirMedTrackingService
 import com.rf.airmedradar.service.InterceptStatus
 import com.rf.airmedradar.ui.theme.AirMedRadarTheme
@@ -169,10 +175,18 @@ fun RadarScreen(viewModel: AirMedRadarViewModel, modifier: Modifier = Modifier) 
     val lzFocusRequestId by viewModel.lzFocusRequestId.collectAsStateWithLifecycle()
     val searchQuery by viewModel.searchQuery.collectAsStateWithLifecycle()
     val addressSuggestions by viewModel.addressSuggestions.collectAsStateWithLifecycle()
+    val activeProfile by viewModel.activeProfile.collectAsStateWithLifecycle()
+    val profiles by viewModel.profiles.collectAsStateWithLifecycle()
 
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
-    val operationalCenter = remember { LatLng(OPERATIONAL_LAT, OPERATIONAL_LON) }
+    // Falls back to the legacy Cincinnati constants only for the brief window before the Room
+    // Flow's first emission on a cold start — once it emits, this always reflects the active
+    // profile's own coordinates instead.
+    val operationalCenter = remember(activeProfile) {
+        activeProfile?.let { LatLng(it.centerLat, it.centerLon) } ?: LatLng(OPERATIONAL_LAT, OPERATIONAL_LON)
+    }
+    var showProfileSheet by remember { mutableStateOf(false) }
 
     var hasLocationPermission by remember { mutableStateOf(hasLocationPermission(context)) }
     val locationPermissionLauncher = rememberLauncherForActivityResult(
@@ -236,6 +250,21 @@ fun RadarScreen(viewModel: AirMedRadarViewModel, modifier: Modifier = Modifier) 
         runCatching {
             cameraPositionState.animate(
                 CameraUpdateFactory.newLatLngBounds(bounds, 150),
+                CAMERA_ANIMATION_DURATION_MS,
+            )
+        }
+    }
+
+    // Re-center on the new region the instant the dispatcher switches profiles. Keyed on the
+    // profile's id (not the whole object) so this doesn't re-fire on unrelated field updates.
+    // Also fires harmlessly on the Room Flow's first cold-start emission — the camera's
+    // initial position (set from this same `operationalCenter` above) already matches, so that
+    // first animate is just a no-op glide to where it already is.
+    LaunchedEffect(activeProfile?.id) {
+        val profile = activeProfile ?: return@LaunchedEffect
+        runCatching {
+            cameraPositionState.animate(
+                CameraUpdateFactory.newLatLngZoom(LatLng(profile.centerLat, profile.centerLon), OPERATIONAL_ZOOM),
                 CAMERA_ANIMATION_DURATION_MS,
             )
         }
@@ -373,7 +402,87 @@ fun RadarScreen(viewModel: AirMedRadarViewModel, modifier: Modifier = Modifier) 
                 ) {
                     Icon(Icons.Default.MyLocation, contentDescription = "Recenter on operational area")
                 }
+
+                FloatingActionButton(
+                    onClick = { showProfileSheet = true },
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .statusBarsPadding()
+                        .padding(end = 16.dp, top = 8.dp),
+                ) {
+                    Icon(Icons.Default.Settings, contentDescription = "Select tracking region")
+                }
             }
+        }
+    }
+
+    if (showProfileSheet) {
+        ProfileSwitcherSheet(
+            profiles = profiles,
+            activeProfileId = activeProfile?.id,
+            onSelect = { profileId ->
+                viewModel.selectProfile(profileId)
+                showProfileSheet = false
+            },
+            onDismiss = { showProfileSheet = false },
+        )
+    }
+}
+
+/**
+ * The dispatcher's region picker: a slide-up sheet listing every saved [UserProfile] with a
+ * radio button, backed live by Room via [AirMedRadarViewModel.profiles]. Picking a row is the
+ * only action here — the actual clear/re-center/re-fetch cascade this triggers all flows from
+ * [AirMedRadarViewModel.selectProfile] writing the new active row, not from anything in this
+ * composable.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ProfileSwitcherSheet(
+    profiles: List<UserProfile>,
+    activeProfileId: Long?,
+    onSelect: (Long) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .navigationBarsPadding()
+                .padding(horizontal = 20.dp, vertical = 8.dp),
+        ) {
+            Text(
+                text = "Tracking Region",
+                style = MaterialTheme.typography.titleMedium,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+            Spacer(Modifier.height(8.dp))
+            profiles.forEach { profile ->
+                val selected = profile.id == activeProfileId
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { onSelect(profile.id) }
+                        .padding(vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    RadioButton(selected = selected, onClick = { onSelect(profile.id) })
+                    Spacer(Modifier.width(8.dp))
+                    Column {
+                        Text(
+                            text = profile.profileName,
+                            style = MaterialTheme.typography.bodyLarge,
+                            color = MaterialTheme.colorScheme.onSurface,
+                        )
+                        Text(
+                            text = "${profile.radiusNM} NM radius • METAR ${profile.metarStationId}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+            Spacer(Modifier.height(8.dp))
         }
     }
 }

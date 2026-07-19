@@ -20,6 +20,9 @@ import com.rf.airmedradar.data.Aircraft
 import com.rf.airmedradar.data.GeocodingService
 import com.rf.airmedradar.data.NetworkUtils
 import com.rf.airmedradar.data.isRotorcraft
+import com.rf.airmedradar.data.profile.AppDatabase
+import com.rf.airmedradar.data.profile.ProfileRepository
+import com.rf.airmedradar.data.profile.UserProfile
 import com.rf.airmedradar.util.formatEtaSeconds
 import java.io.IOException
 import java.net.SocketTimeoutException
@@ -32,7 +35,9 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -60,6 +65,7 @@ class AirMedTrackingService : Service() {
     private val serviceScope = CoroutineScope(Dispatchers.Default + serviceJob)
 
     private val repository = AdsbRepository()
+    private val profileRepository by lazy { ProfileRepository(AppDatabase.getInstance(applicationContext).userProfileDao()) }
 
     private val _liveAircraft = MutableStateFlow<List<Aircraft>>(emptyList())
     private val _isOffline = MutableStateFlow(false)
@@ -134,22 +140,47 @@ class AirMedTrackingService : Service() {
         postNotificationSafely(TRACKING_NOTIFICATION_ID, buildTrackingNotification())
     }
 
+    /**
+     * Drives polling off the active region Flow rather than a fixed schedule: `collectLatest`
+     * cancels the previous region's while-loop (including whatever `delay` it was mid-way
+     * through) the instant a new profile becomes active, resets the stale region's state, and
+     * immediately runs a fresh poll for the new one — no separate "force refresh" signal is
+     * needed, and the normal [POLL_INTERVAL_MS] cadence simply resumes for the new region.
+     */
     private fun startPollingLoop() {
         serviceScope.launch {
-            while (isActive) {
-                refreshAircraft()
-                tick()
-                delay(POLL_INTERVAL_MS)
+            profileRepository.activeProfile.filterNotNull().collectLatest { profile ->
+                resetForNewProfile()
+                while (isActive) {
+                    refreshAircraft(profile)
+                    tick()
+                    delay(POLL_INTERVAL_MS)
+                }
             }
         }
     }
 
     /**
-     * Pulls the latest telemetry batch. On any network failure, last-known aircraft
-     * positions are simply left in place (`_liveAircraft` is untouched) and the next
+     * Clears every piece of per-region state that would otherwise leak across a profile
+     * switch: last-known aircraft (so a stale Cincinnati marker never flashes over Houston),
+     * position trails, the active search target/intercept status, and alert edge-triggers.
+     */
+    private fun resetForNewProfile() {
+        aircraftHistory.clear()
+        previousTargetDistanceNm.clear()
+        hasFiredInboundAlert = false
+        _liveAircraft.value = emptyList()
+        _targetCoordinate.value = null
+        _interceptStatus.value = null
+        _hasLanded.value = false
+    }
+
+    /**
+     * Pulls the latest telemetry batch for [profile]. On any network failure, last-known
+     * aircraft positions are simply left in place (`_liveAircraft` is untouched) and the next
      * scheduled tick retries cleanly — a dropped signal never crashes this service.
      */
-    private suspend fun refreshAircraft() {
+    private suspend fun refreshAircraft(profile: UserProfile) {
         if (!NetworkUtils.isOnline(applicationContext)) {
             _isOffline.value = true
             Log.w(TAG, "Skipping poll: device reports no active network")
@@ -157,9 +188,9 @@ class AirMedTrackingService : Service() {
         }
         try {
             val fetched = repository.fetchAircraftNear(
-                lat = OPERATIONAL_CENTER_LAT,
-                lon = OPERATIONAL_CENTER_LON,
-                radiusNm = TRACKING_RADIUS_NM,
+                lat = profile.centerLat,
+                lon = profile.centerLon,
+                radiusNm = profile.radiusNM,
             )
             val rotorcraft = fetched.filter { it.hasPosition && it.isRotorcraft() }
             val withHistory = attachHistory(rotorcraft)
@@ -370,9 +401,6 @@ class AirMedTrackingService : Service() {
         private const val ALERT_NOTIFICATION_ID = 1002
         private const val OPEN_APP_REQUEST_CODE = 2001
 
-        private const val OPERATIONAL_CENTER_LAT = 39.0
-        private const val OPERATIONAL_CENTER_LON = -84.9
-        private const val TRACKING_RADIUS_NM = 75
         private const val POLL_INTERVAL_MS = 12_000L
         private const val METERS_PER_NAUTICAL_MILE = 1852.0
         private const val LANDING_THRESHOLD_NM = 0.3
