@@ -59,7 +59,6 @@ class AirMedRadarViewModel(application: Application) : AndroidViewModel(applicat
         val serviceIntent = Intent(context, AirMedTrackingService::class.java)
         ContextCompat.startForegroundService(context, serviceIntent)
         context.bindService(serviceIntent, connection, Context.BIND_AUTO_CREATE)
-        observeSearchQuery()
     }
 
     @OptIn(ExperimentalCoroutinesApi::class)
@@ -102,6 +101,12 @@ class AirMedRadarViewModel(application: Application) : AndroidViewModel(applicat
 
     private val _addressSuggestions = MutableStateFlow<List<AutocompletePrediction>>(emptyList())
     val addressSuggestions: StateFlow<List<AutocompletePrediction>> = _addressSuggestions.asStateFlow()
+
+    init {
+        // Must run after _searchQuery/placesRepository are initialized above — an init block
+        // runs at its source position, not after the whole constructor body completes.
+        observeSearchQuery()
+    }
 
     fun selectAircraft(aircraft: Aircraft?) {
         _selectedAircraft.value = aircraft
