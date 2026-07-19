@@ -32,6 +32,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -309,7 +310,14 @@ fun RadarScreen(viewModel: AirMedRadarViewModel, modifier: Modifier = Modifier) 
                 Column(
                     modifier = Modifier
                         .align(Alignment.TopCenter)
-                        .fillMaxWidth(),
+                        .fillMaxWidth()
+                        // Pushes the banner stack (and everything below it, including the
+                        // search bar) below the status bar/camera cutout — GoogleMap is a
+                        // separate sibling above in this Box and is untouched, so the map
+                        // itself keeps rendering fullscreen behind the status bar exactly as
+                        // enableEdgeToEdge() intends. Only this overlay column needs to avoid
+                        // that space.
+                        .statusBarsPadding(),
                     horizontalAlignment = Alignment.CenterHorizontally,
                 ) {
                     // HEMS weather minimums banner: the highest-priority safety signal on
