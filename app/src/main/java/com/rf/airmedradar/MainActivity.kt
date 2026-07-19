@@ -86,7 +86,6 @@ import com.google.android.gms.maps.model.CameraPosition
 import com.google.android.gms.maps.model.Dash
 import com.google.android.gms.maps.model.Gap
 import com.google.android.gms.maps.model.LatLng
-import com.google.android.gms.maps.model.LatLngBounds
 import com.google.android.gms.maps.model.MapStyleOptions
 import com.google.maps.android.compose.Circle
 import com.google.maps.android.compose.GoogleMap
@@ -111,6 +110,7 @@ import kotlinx.coroutines.launch
 private const val OPERATIONAL_LAT = 39.0
 private const val OPERATIONAL_LON = -84.9
 private const val OPERATIONAL_ZOOM = 9.5f
+private const val LZ_FOCUS_ZOOM = 13f
 private const val CAMERA_ANIMATION_DURATION_MS = 800
 private const val METERS_PER_NAUTICAL_MILE = 1852.0
 
@@ -230,18 +230,17 @@ fun RadarScreen(viewModel: AirMedRadarViewModel, modifier: Modifier = Modifier) 
     // so the lines disappear the instant the search is cleared or the aircraft arrives.
     val activeTargetAircraft = if (targetCoordinate != null && !hasLanded) interceptStatus?.aircraft else null
 
-    // Frame the operational center + target whenever the target changes, or when the user
-    // re-enters the app via the tracking notification (lzFocusRequestId bump) even if the
-    // target coordinate itself hasn't changed since they left.
+    // Zoom directly into the resolved landing zone whenever the target changes, or when the
+    // user re-enters the app via the tracking notification (lzFocusRequestId bump) even if the
+    // target coordinate itself hasn't changed since they left. Deliberately a direct
+    // center+zoom on the LZ itself (not a bounds-fit including the device/operational center)
+    // — a dispatcher who just resolved an address wants to see that arrival point and its
+    // immediate surroundings, not a wide shot stretched to also frame wherever the phone is.
     LaunchedEffect(targetCoordinate, lzFocusRequestId) {
         val target = targetCoordinate ?: return@LaunchedEffect
-        val bounds = LatLngBounds.Builder()
-            .include(operationalCenter)
-            .include(target)
-            .build()
         runCatching {
             cameraPositionState.animate(
-                CameraUpdateFactory.newLatLngBounds(bounds, 150),
+                CameraUpdateFactory.newLatLngZoom(target, LZ_FOCUS_ZOOM),
                 CAMERA_ANIMATION_DURATION_MS,
             )
         }
