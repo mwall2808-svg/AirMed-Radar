@@ -15,6 +15,11 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -45,6 +50,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.SearchBar
 import androidx.compose.material3.SearchBarDefaults
 import androidx.compose.material3.SheetValue
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberBottomSheetScaffoldState
 import androidx.compose.material3.rememberStandardBottomSheetState
@@ -65,6 +71,7 @@ import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -96,6 +103,8 @@ import com.rf.airmedradar.service.InterceptStatus
 import com.rf.airmedradar.ui.theme.AirMedRadarTheme
 import com.rf.airmedradar.util.formatEtaSeconds
 import com.rf.airmedradar.viewmodel.AirMedRadarViewModel
+import com.rf.airmedradar.weather.FlightStatus
+import com.rf.airmedradar.weather.WeatherMinimumsEvaluation
 import kotlinx.coroutines.launch
 
 private const val OPERATIONAL_LAT = 39.0
@@ -150,6 +159,8 @@ private fun hasNotificationPermission(context: Context): Boolean {
 @Composable
 fun RadarScreen(viewModel: AirMedRadarViewModel, modifier: Modifier = Modifier) {
     val aircraft by viewModel.aircraft.collectAsStateWithLifecycle()
+    val isOffline by viewModel.isOffline.collectAsStateWithLifecycle()
+    val weatherEvaluation by viewModel.weatherEvaluation.collectAsStateWithLifecycle()
     val selectedAircraft by viewModel.selectedAircraft.collectAsStateWithLifecycle()
     val targetCoordinate by viewModel.targetCoordinate.collectAsStateWithLifecycle()
     val interceptStatus by viewModel.interceptStatus.collectAsStateWithLifecycle()
@@ -295,17 +306,47 @@ fun RadarScreen(viewModel: AirMedRadarViewModel, modifier: Modifier = Modifier) 
                     }
                 }
 
-                TargetSearchBar(
+                Column(
                     modifier = Modifier
                         .align(Alignment.TopCenter)
-                        .padding(top = 16.dp, start = 16.dp, end = 16.dp),
-                    query = searchQuery,
-                    suggestions = addressSuggestions,
-                    onQueryChange = viewModel::onQueryChanged,
-                    onSearch = viewModel::searchTarget,
-                    onSuggestionClick = viewModel::onSuggestionSelected,
-                    onClear = viewModel::clearTarget,
-                )
+                        .fillMaxWidth(),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    // HEMS weather minimums banner: the highest-priority safety signal on
+                    // screen, so it stacks above the feed-staleness warning. Absent (no
+                    // AnimatedVisibility trigger) until the first METAR fetch resolves —
+                    // there's no "unknown" visual state, it simply isn't shown yet.
+                    AnimatedVisibility(
+                        visible = weatherEvaluation != null,
+                        enter = slideInVertically(initialOffsetY = { -it }) + fadeIn(),
+                        exit = slideOutVertically(targetOffsetY = { -it }) + fadeOut(),
+                    ) {
+                        weatherEvaluation?.let { FlightStatusBanner(it) }
+                    }
+                    // Feed-staleness warning: purely a UI reflection of the ViewModel's
+                    // isOffline StateFlow (already plumbed end-to-end since Phase 6's network
+                    // resilience work — the Service was setting this correctly the whole time,
+                    // it just had no on-screen consumer). Slides in the instant a poll fails
+                    // and back out the instant one succeeds, with zero effect on the map/marker
+                    // layers underneath: they keep rendering whatever aircraft/history state
+                    // they last held, since the Service never clears state on a failed poll.
+                    AnimatedVisibility(
+                        visible = isOffline,
+                        enter = slideInVertically(initialOffsetY = { -it }) + fadeIn(),
+                        exit = slideOutVertically(targetOffsetY = { -it }) + fadeOut(),
+                    ) {
+                        OfflineStatusBanner()
+                    }
+                    TargetSearchBar(
+                        modifier = Modifier.padding(top = 16.dp, start = 16.dp, end = 16.dp),
+                        query = searchQuery,
+                        suggestions = addressSuggestions,
+                        onQueryChange = viewModel::onQueryChanged,
+                        onSearch = viewModel::searchTarget,
+                        onSuggestionClick = viewModel::onSuggestionSelected,
+                        onClear = viewModel::clearTarget,
+                    )
+                }
 
                 FloatingActionButton(
                     onClick = {
@@ -326,6 +367,75 @@ fun RadarScreen(viewModel: AirMedRadarViewModel, modifier: Modifier = Modifier) 
                 }
             }
         }
+    }
+}
+
+/**
+ * Thin, high-contrast warning that the telemetry feed has gone stale. Deliberately opaque
+ * and full-width (not a translucent overlay) so it reads instantly against any map terrain,
+ * but confined to a single line so it never blocks marker taps, the search bar, or the FAB.
+ */
+@Composable
+private fun OfflineStatusBanner(modifier: Modifier = Modifier) {
+    Surface(
+        modifier = modifier.fillMaxWidth(),
+        color = Color(0xFFFFA000), // dark amber
+    ) {
+        Text(
+            text = "⚠️ RADAR FEED OFFLINE — SHOWING LAST KNOWN POSITIONS",
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(vertical = 10.dp, horizontal = 16.dp),
+            color = Color.Black,
+            fontWeight = FontWeight.Bold,
+            fontSize = 13.sp,
+            textAlign = TextAlign.Center,
+        )
+    }
+}
+
+/**
+ * FAA Part 135 HEMS weather-minimums status, styled identically to [OfflineStatusBanner]
+ * (opaque, full-width, single line) so the two stack cleanly, but color-coded per
+ * [FlightStatus] rather than a fixed amber — this banner's color *is* the go/no-go signal.
+ */
+@Composable
+private fun FlightStatusBanner(evaluation: WeatherMinimumsEvaluation, modifier: Modifier = Modifier) {
+    val ceilingText = evaluation.ceilingFtAgl?.let { "$it ft" } ?: "N/A"
+    val visibilityText = evaluation.visibilitySm?.let { "%.1f SM".format(it) } ?: "N/A"
+
+    val (backgroundColor, textColor, message) = when (evaluation.status) {
+        FlightStatus.GREEN -> Triple(
+            Color(0xFF1B5E20), // soft dark green
+            Color.White,
+            "🟢 FLIGHT RADAR OPEN - WEATHER GOOD TO FLY",
+        )
+        FlightStatus.YELLOW -> Triple(
+            Color(0xFFFF8F00), // deep amber
+            Color.Black,
+            "⚠️ MARGINAL CONDITIONS - FLIGHT STATUS QUESTIONABLE (Ceiling: $ceilingText, Vis: $visibilityText)",
+        )
+        FlightStatus.RED -> Triple(
+            Color(0xFFB71C1C), // sharp crimson
+            Color.White,
+            "🛑 NO GO FOR FLIGHT - WEATHER BELOW HEMS MINIMUMS (Ceiling: $ceilingText, Vis: $visibilityText)",
+        )
+    }
+
+    Surface(
+        modifier = modifier.fillMaxWidth(),
+        color = backgroundColor,
+    ) {
+        Text(
+            text = message,
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(vertical = 10.dp, horizontal = 16.dp),
+            color = textColor,
+            fontWeight = FontWeight.Bold,
+            fontSize = 13.sp,
+            textAlign = TextAlign.Center,
+        )
     }
 }
 

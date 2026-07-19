@@ -15,11 +15,15 @@ import com.google.android.libraries.places.api.model.AutocompletePrediction
 import com.google.android.libraries.places.api.model.AutocompleteSessionToken
 import com.rf.airmedradar.data.Aircraft
 import com.rf.airmedradar.data.PlacesAutocompleteRepository
+import com.rf.airmedradar.data.WeatherRepository
 import com.rf.airmedradar.service.AirMedTrackingService
 import com.rf.airmedradar.service.InterceptStatus
 import com.rf.airmedradar.service.TrackingSnapshot
+import com.rf.airmedradar.weather.WeatherMinimumsEvaluation
+import com.rf.airmedradar.weather.evaluateFlightStatus
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.FlowPreview
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -31,7 +35,10 @@ import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+
+private const val WEATHER_POLL_INTERVAL_MS = 15 * 60 * 1_000L
 
 /**
  * Thin UI-facing façade over [AirMedTrackingService]: starts the always-running telemetry
@@ -85,6 +92,32 @@ class AirMedRadarViewModel(application: Application) : AndroidViewModel(applicat
      */
     private val _lzFocusRequestId = MutableStateFlow(0L)
     val lzFocusRequestId: StateFlow<Long> = _lzFocusRequestId.asStateFlow()
+
+    // --- HEMS weather minimums monitor: independent of the tracking Service/snapshot since
+    // it has nothing to do with aircraft telemetry, just the local METAR feed. Polls on its
+    // own 15-minute cadence — weather doesn't change fast enough to warrant the Service's
+    // much shorter aircraft-poll interval, and a failed fetch simply skips that tick, leaving
+    // the last-known-good evaluation on screen rather than clearing it. ---
+
+    private val weatherRepository = WeatherRepository()
+
+    private val _weatherEvaluation = MutableStateFlow<WeatherMinimumsEvaluation?>(null)
+    val weatherEvaluation: StateFlow<WeatherMinimumsEvaluation?> = _weatherEvaluation.asStateFlow()
+
+    init {
+        observeWeatherMinimums()
+    }
+
+    private fun observeWeatherMinimums() {
+        viewModelScope.launch {
+            while (isActive) {
+                weatherRepository.fetchLatestMetar()?.let { observation ->
+                    _weatherEvaluation.value = evaluateFlightStatus(observation)
+                }
+                delay(WEATHER_POLL_INTERVAL_MS)
+            }
+        }
+    }
 
     // --- Places predictive autocomplete (purely UI-facing; the background engine doesn't
     // need to know about in-progress typing, only the final resolved target). ---
