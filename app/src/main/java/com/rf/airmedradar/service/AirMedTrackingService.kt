@@ -81,6 +81,19 @@ class AirMedTrackingService : Service() {
     private val _isTargetLocked = MutableStateFlow(false)
     private val _etaSeconds = MutableStateFlow<Long?>(null)
 
+    /**
+     * Debug-only synthetic aircraft merged into every real fetched batch — see
+     * [updateMockAircraftLocally]. Null in normal operation; only ever set by the Phase 9.11
+     * launch simulator ([com.rf.airmedradar.debug.MockHemsController] via the ViewModel).
+     */
+    private val _mockAircraftOverride = MutableStateFlow<Aircraft?>(null)
+
+    /** The most recent real fetch, cached so the simulator's frequent position ticks during
+     *  TERMINAL_APPROACH can re-run the filter/gate pipeline (see [processBatch]) without
+     *  re-hitting the network every couple of seconds — only [refreshAircraft] itself, on its
+     *  normal 12s cadence or an explicit [triggerImmediateRefresh], actually calls the API. */
+    private var lastFetchedBatch: List<Aircraft> = emptyList()
+
     private val telemetrySnapshot: StateFlow<TrackingSnapshot> = combine(
         _liveAircraft,
         _isOffline,
@@ -271,26 +284,9 @@ class AirMedTrackingService : Service() {
                 lon = center.longitude,
                 radiusNm = TRACKING_RADIUS_NM,
             )
-            val watchList = _activeWatchList.value
-            val candidates = if (watchList.isNotEmpty()) {
-                // Tail-lock filter: once a provider has been dispatched, completely ignore
-                // every other aircraft in the sky — including other rotorcraft — and isolate
-                // strictly by registration membership in the dispatcher's confirmed fleet.
-                fetched.filter { it.hasPosition && it.registration?.uppercase() in watchList }
-            } else {
-                fetched.filter { it.hasPosition && it.isRotorcraft() }
-            }
-            val validated = if (watchList.isNotEmpty()) applyTrajectoryGate(candidates) else candidates
-
-            val withHistory = attachHistory(validated)
-            _liveAircraft.value = withHistory
+            lastFetchedBatch = fetched
             _isOffline.value = false
-            updateInterceptStatus(withHistory)
-            _etaSeconds.value = if (watchList.isNotEmpty()) computeLockedTargetEta(withHistory) else null
-            // Runs against the full bounding-box batch, not just `candidates`/`validated` above
-            // — ICAO type-code discovery is an independent classification from the tail-lock/
-            // isRotorcraft() filters and shouldn't be narrowed by either.
-            _discoveredProviders.value = discoverHemsProviders(fetched)
+            processBatch(fetched)
         } catch (e: UnknownHostException) {
             Log.w(TAG, "adsb.lol unreachable (no DNS/connectivity) — retaining last known positions", e)
             _isOffline.value = true
@@ -305,6 +301,61 @@ class AirMedTrackingService : Service() {
             // down a foreground service running unattended for an entire shift.
             Log.e(TAG, "Unexpected error refreshing aircraft telemetry", e)
             _isOffline.value = true
+        }
+    }
+
+    /**
+     * The real tail-lock filter / trajectory gate / history / intercept pipeline, run against
+     * [fetched] — a real ADS-B batch merged with the debug-only [_mockAircraftOverride], if one
+     * is set. Factored out of [refreshAircraft] specifically so the Phase 9.11 launch simulator
+     * can re-run this exact same logic on every simulated position tick via
+     * [updateMockAircraftLocally] without forcing a real network call each time.
+     */
+    private fun processBatch(fetched: List<Aircraft>) {
+        val combined = fetched + listOfNotNull(_mockAircraftOverride.value)
+        val watchList = _activeWatchList.value
+        val candidates = if (watchList.isNotEmpty()) {
+            // Tail-lock filter: once a provider has been dispatched, completely ignore
+            // every other aircraft in the sky — including other rotorcraft — and isolate
+            // strictly by registration membership in the dispatcher's confirmed fleet.
+            combined.filter { it.hasPosition && it.registration?.uppercase() in watchList }
+        } else {
+            combined.filter { it.hasPosition && it.isRotorcraft() }
+        }
+        val validated = if (watchList.isNotEmpty()) applyTrajectoryGate(candidates) else candidates
+
+        val withHistory = attachHistory(validated)
+        _liveAircraft.value = withHistory
+        updateInterceptStatus(withHistory)
+        _etaSeconds.value = if (watchList.isNotEmpty()) computeLockedTargetEta(withHistory) else null
+        // Runs against the full combined batch, not just `candidates`/`validated` above — ICAO
+        // type-code discovery is an independent classification from the tail-lock/
+        // isRotorcraft() filters and shouldn't be narrowed by either.
+        _discoveredProviders.value = discoverHemsProviders(combined)
+    }
+
+    /**
+     * Debug-only entry point for the Phase 9.11 launch simulator: merges [aircraft] into the
+     * pipeline and immediately re-runs it against the last real fetch — no network call, so
+     * this is safe to call frequently (e.g. every couple of seconds during a simulated
+     * approach) without hammering the real ADS-B API.
+     */
+    fun updateMockAircraftLocally(aircraft: Aircraft?) {
+        _mockAircraftOverride.value = aircraft
+        processBatch(lastFetchedBatch)
+    }
+
+    /**
+     * Debug-only: forces one full real poll (network fetch included) right now instead of
+     * waiting for the next scheduled tick, so a simulator stage change reads as instant rather
+     * than lagging behind the normal 12s cadence.
+     */
+    fun triggerImmediateRefresh() {
+        serviceScope.launch {
+            _deviceLocation.value?.let { center ->
+                refreshAircraft(center)
+                tick()
+            }
         }
     }
 

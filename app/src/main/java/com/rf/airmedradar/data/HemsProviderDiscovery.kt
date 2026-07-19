@@ -27,6 +27,10 @@ private val CALLSIGN_PROVIDER_NAMES = mapOf(
     "GRDWNG" to "Guardian Flight",
     "HEALNT" to "HealthNet Aeromedical",
     "REACH" to "REACH Air Medical",
+    // Phase 9.11 launch simulator's synthetic callsign ("TTM01") — see
+    // com.rf.airmedradar.debug.MockHemsController — so a mock aircraft discovers consistently
+    // by name here too, not just via the Phase 9.9 tail-lock filter it primarily exercises.
+    "TTM" to "Tab Test Medical",
 )
 
 /** A HEMS operator identified live from the current telemetry batch, not a pre-seeded list. */

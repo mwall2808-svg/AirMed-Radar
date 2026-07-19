@@ -35,6 +35,9 @@ android {
     }
     buildFeatures {
         compose = true
+        // Enables BuildConfig.DEBUG, gating the Phase 9.11 mock HEMS launch simulator (debug
+        // panel + telemetry injection) so it never compiles into a release build's UI surface.
+        buildConfig = true
     }
 }
 
