@@ -34,4 +34,8 @@ data class TrackingSnapshot(
      *  tick — see [AirMedTrackingService]'s trigonometric bearing-vs-heading check. False
      *  whenever [isSearching] is false, since there's nothing to lock onto. */
     val isTargetLocked: Boolean = false,
+    /** Seconds until the locked aircraft closes the distance to the LZ at its current
+     *  groundspeed — see [com.rf.airmedradar.util.remainingSeconds]. Null whenever
+     *  [isTargetLocked] is false: there's no validated target to compute an arrival for. */
+    val etaSeconds: Long? = null,
 )

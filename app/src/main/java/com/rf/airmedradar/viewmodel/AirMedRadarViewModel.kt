@@ -130,9 +130,22 @@ class AirMedRadarViewModel(application: Application) : AndroidViewModel(applicat
     val isTargetLocked: StateFlow<Boolean> =
         snapshot.map { it.isTargetLocked }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), false)
 
+    /** Metric arrival countdown (seconds) for the locked target — see
+     *  [AirMedTrackingService.computeLockedTargetEta]. Null whenever [isTargetLocked] is false. */
+    val etaSeconds: StateFlow<Long?> =
+        snapshot.map { it.etaSeconds }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
+
+    /** The dispatched provider's display name, for the tactical lock overlay ("UC Air Care
+     *  Inbound"). Purely a UI label — the Service only needs [HemsProviderEntity.tailNumbers]
+     *  to actually filter telemetry, so this is tracked locally rather than round-tripped
+     *  through the Service and back. */
+    private val _dispatchedProviderName = MutableStateFlow<String?>(null)
+    val dispatchedProviderName: StateFlow<String?> = _dispatchedProviderName.asStateFlow()
+
     /** Dispatcher confirmed [provider] as the responding unit from the selection popup: tells
      *  the Service to tail-lock its next poll onto exactly this fleet's registrations. */
     fun selectProvider(provider: HemsProviderEntity) {
+        _dispatchedProviderName.value = provider.providerName
         _boundService.value?.setActiveWatchList(provider.tailNumbers)
     }
 
@@ -268,6 +281,7 @@ class AirMedRadarViewModel(application: Application) : AndroidViewModel(applicat
         _searchQuery.value = ""
         _addressSuggestions.value = emptyList()
         sessionToken = AutocompleteSessionToken.newInstance()
+        _dispatchedProviderName.value = null
     }
 
     override fun onCleared() {

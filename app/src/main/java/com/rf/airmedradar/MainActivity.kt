@@ -116,6 +116,8 @@ import com.rf.airmedradar.util.formatEtaSeconds
 import com.rf.airmedradar.viewmodel.AirMedRadarViewModel
 import com.rf.airmedradar.weather.FlightStatus
 import com.rf.airmedradar.weather.WeatherMinimumsEvaluation
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 private const val OPERATIONAL_LAT = 39.0
@@ -182,6 +184,9 @@ fun RadarScreen(viewModel: AirMedRadarViewModel, modifier: Modifier = Modifier) 
     val addressSuggestions by viewModel.addressSuggestions.collectAsStateWithLifecycle()
     val deviceLocation by viewModel.deviceLocation.collectAsStateWithLifecycle()
     val registeredProviders by viewModel.providers.collectAsStateWithLifecycle()
+    val isTargetLocked by viewModel.isTargetLocked.collectAsStateWithLifecycle()
+    val etaSecondsFromService by viewModel.etaSeconds.collectAsStateWithLifecycle()
+    val dispatchedProviderName by viewModel.dispatchedProviderName.collectAsStateWithLifecycle()
 
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
@@ -238,9 +243,25 @@ fun RadarScreen(viewModel: AirMedRadarViewModel, modifier: Modifier = Modifier) 
     // The one aircraft the breadcrumb trail + destination projection line are drawn for:
     // the system-identified closest inbound responder (interceptStatus), NOT selectedAircraft
     // (a marker tap is just "show me details" and shouldn't spawn lines for an arbitrary
-    // aircraft). Null whenever there's no active target or the responder has already landed,
-    // so the lines disappear the instant the search is cleared or the aircraft arrives.
-    val activeTargetAircraft = if (targetCoordinate != null && !hasLanded) interceptStatus?.aircraft else null
+    // aircraft). Requires isTargetLocked, not just an active target — Phase 9.9's tail-lock/
+    // trajectory gate is what actually validates this is the real responding aircraft, not an
+    // identical-fleet aircraft on an unrelated run; lines only belong on a validated lock.
+    val activeTargetAircraft =
+        if (targetCoordinate != null && !hasLanded && isTargetLocked) interceptStatus?.aircraft else null
+
+    // Ticks the tactical lock overlay's countdown down every second between polls, so it reads
+    // as a live clock rather than jumping only once per 12s telemetry refresh. Re-anchors to
+    // the Service's freshly computed value (etaSecondsFromService) the moment a new poll lands.
+    var displayedEtaSeconds by remember { mutableStateOf<Long?>(null) }
+    LaunchedEffect(etaSecondsFromService) {
+        displayedEtaSeconds = etaSecondsFromService
+        while (isActive) {
+            val remaining = displayedEtaSeconds ?: break
+            if (remaining <= 0) break
+            delay(1_000)
+            displayedEtaSeconds = remaining - 1
+        }
+    }
 
     // Zoom directly into the resolved landing zone whenever the target changes, or when the
     // user re-enters the app via the tracking notification (lzFocusRequestId bump) even if the
@@ -413,6 +434,21 @@ fun RadarScreen(viewModel: AirMedRadarViewModel, modifier: Modifier = Modifier) 
                         .padding(end = 16.dp, bottom = innerPadding.calculateBottomPadding() + 16.dp),
                 ) {
                     Icon(Icons.Default.MyLocation, contentDescription = "Recenter on operational area")
+                }
+
+                // Tactical lock overlay: the upper-right countdown card, visible exclusively
+                // while isTargetLocked is true — smoothly dismissed (not just snapped away) the
+                // instant the target is lost or fails the trajectory gate on a later poll.
+                AnimatedVisibility(
+                    visible = isTargetLocked,
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .statusBarsPadding()
+                        .padding(top = 8.dp, end = 16.dp),
+                    enter = fadeIn() + slideInVertically(initialOffsetY = { -it / 2 }),
+                    exit = fadeOut() + slideOutVertically(targetOffsetY = { -it / 2 }),
+                ) {
+                    TacticalLockCard(providerName = dispatchedProviderName, etaSeconds = displayedEtaSeconds)
                 }
             }
         }
@@ -652,6 +688,44 @@ private fun FlightStatusBanner(evaluation: WeatherMinimumsEvaluation, modifier: 
             textAlign = TextAlign.Center,
         )
     }
+}
+
+/**
+ * Small, high-contrast, semi-transparent tactical dashboard for the locked target — the
+ * upper-right counterpart to the top banners, deliberately compact since it only ever needs
+ * to convey two facts at a glance: who's responding, and how long until they arrive.
+ */
+@Composable
+private fun TacticalLockCard(providerName: String?, etaSeconds: Long?, modifier: Modifier = Modifier) {
+    Surface(
+        modifier = modifier,
+        color = Color.Black.copy(alpha = 0.68f),
+        shape = RoundedCornerShape(10.dp),
+    ) {
+        Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+            Text(
+                text = "${providerName ?: "Target"} Inbound",
+                color = Color.White,
+                fontWeight = FontWeight.Bold,
+                fontSize = 12.sp,
+            )
+            Text(
+                text = "${formatCountdownClock(etaSeconds)} Min",
+                color = Color(0xFF00E676), // bright green — tactical/HUD read
+                fontWeight = FontWeight.Bold,
+                fontSize = 18.sp,
+            )
+        }
+    }
+}
+
+/** Formats a countdown in whole seconds as "MM:SS"; "--:--" when there's nothing to show yet
+ *  (no groundspeed/position reading this tick) rather than a misleading "00:00". */
+private fun formatCountdownClock(seconds: Long?): String {
+    if (seconds == null || seconds < 0) return "--:--"
+    val minutes = seconds / 60
+    val remainingSeconds = seconds % 60
+    return "%02d:%02d".format(minutes, remainingSeconds)
 }
 
 private val AIRCRAFT_ICON_COLOR = Color(0xFF2979FF) // azure

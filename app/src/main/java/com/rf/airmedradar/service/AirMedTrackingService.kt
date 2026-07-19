@@ -23,9 +23,11 @@ import com.rf.airmedradar.data.LocationRepository
 import com.rf.airmedradar.data.NetworkUtils
 import com.rf.airmedradar.data.discoverHemsProviders
 import com.rf.airmedradar.data.isRotorcraft
+import com.rf.airmedradar.util.distanceMeters
 import com.rf.airmedradar.util.formatEtaSeconds
 import com.rf.airmedradar.util.initialBearingDegrees
 import com.rf.airmedradar.util.isOnTrajectoryToTarget
+import com.rf.airmedradar.util.remainingSeconds
 import java.io.IOException
 import java.net.SocketTimeoutException
 import java.net.UnknownHostException
@@ -77,6 +79,7 @@ class AirMedTrackingService : Service() {
     private val _discoveredProviders = MutableStateFlow<List<DiscoveredHemsProvider>>(emptyList())
     private val _activeWatchList = MutableStateFlow<List<String>>(emptyList())
     private val _isTargetLocked = MutableStateFlow(false)
+    private val _etaSeconds = MutableStateFlow<Long?>(null)
 
     private val telemetrySnapshot: StateFlow<TrackingSnapshot> = combine(
         _liveAircraft,
@@ -94,20 +97,37 @@ class AirMedTrackingService : Service() {
         )
     }.stateIn(serviceScope, SharingStarted.Eagerly, TrackingSnapshot())
 
+    /**
+     * The tail-lock/trajectory trio bundled into one flow first — the typed [combine] overload
+     * tops out at 5 flows, and [snapshot] below already needs 4 others alongside this.
+     */
+    private data class TargetLockState(
+        val activeWatchList: List<String>,
+        val isTargetLocked: Boolean,
+        val etaSeconds: Long?,
+    )
+
+    private val targetLockState: StateFlow<TargetLockState> = combine(
+        _activeWatchList,
+        _isTargetLocked,
+        _etaSeconds,
+    ) { watchList, targetLocked, eta -> TargetLockState(watchList, targetLocked, eta) }
+        .stateIn(serviceScope, SharingStarted.Eagerly, TargetLockState(emptyList(), false, null))
+
     /** Single source of truth for the UI — everything it needs to render in one flow. */
     val snapshot: StateFlow<TrackingSnapshot> = combine(
         telemetrySnapshot,
         _deviceLocation,
         _discoveredProviders,
-        _activeWatchList,
-        _isTargetLocked,
-    ) { base, location, providers, watchList, targetLocked ->
+        targetLockState,
+    ) { base, location, providers, lockState ->
         base.copy(
             deviceLocation = location,
             discoveredProviders = providers,
-            activeWatchList = watchList,
-            isSearching = watchList.isNotEmpty(),
-            isTargetLocked = targetLocked,
+            activeWatchList = lockState.activeWatchList,
+            isSearching = lockState.activeWatchList.isNotEmpty(),
+            isTargetLocked = lockState.isTargetLocked,
+            etaSeconds = lockState.etaSeconds,
         )
     }.stateIn(serviceScope, SharingStarted.Eagerly, TrackingSnapshot())
 
@@ -173,12 +193,14 @@ class AirMedTrackingService : Service() {
     fun setActiveWatchList(tailNumbers: List<String>) {
         _activeWatchList.value = tailNumbers.map { it.uppercase() }
         _isTargetLocked.value = false
+        _etaSeconds.value = null
     }
 
     /** Reverts to showing every rotorcraft in range instead of a tail-locked fleet. */
     fun clearActiveWatchList() {
         _activeWatchList.value = emptyList()
         _isTargetLocked.value = false
+        _etaSeconds.value = null
     }
 
     /** Non-null once the recurring poll ticker has been started for this session — see
@@ -264,6 +286,7 @@ class AirMedTrackingService : Service() {
             _liveAircraft.value = withHistory
             _isOffline.value = false
             updateInterceptStatus(withHistory)
+            _etaSeconds.value = if (watchList.isNotEmpty()) computeLockedTargetEta(withHistory) else null
             // Runs against the full bounding-box batch, not just `candidates`/`validated` above
             // — ICAO type-code discovery is an independent classification from the tail-lock/
             // isRotorcraft() filters and shouldn't be narrowed by either.
@@ -310,6 +333,22 @@ class AirMedTrackingService : Service() {
         }
         _isTargetLocked.value = validated.isNotEmpty()
         return validated
+    }
+
+    /**
+     * Metric arrival countdown for the locked target: straight-line distance (meters) from the
+     * locked aircraft's current position to the LZ, divided by its groundspeed converted from
+     * knots to meters/second (1 kt = 0.514444 m/s). Exclusively for a validated, trajectory-
+     * gated target — [lockedAircraft] is expected to already be that filtered set, so this
+     * simply takes the first (closest, per [applyTrajectoryGate]'s upstream ordering) entry.
+     * Null whenever there's no locked aircraft, no LZ, or no usable position/speed reading.
+     */
+    private fun computeLockedTargetEta(lockedAircraft: List<Aircraft>): Long? {
+        val target = _targetCoordinate.value ?: return null
+        val aircraft = lockedAircraft.firstOrNull() ?: return null
+        val position = aircraft.currentCoordinates ?: return null
+        val groundSpeedKnots = aircraft.groundSpeedKts ?: return null
+        return remainingSeconds(distanceMeters(position, target), groundSpeedKnots)
     }
 
     /**
