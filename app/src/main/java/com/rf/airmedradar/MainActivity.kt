@@ -205,6 +205,13 @@ fun RadarScreen(viewModel: AirMedRadarViewModel, modifier: Modifier = Modifier) 
         )
     }
 
+    // The one aircraft the breadcrumb trail + destination projection line are drawn for:
+    // the system-identified closest inbound responder (interceptStatus), NOT selectedAircraft
+    // (a marker tap is just "show me details" and shouldn't spawn lines for an arbitrary
+    // aircraft). Null whenever there's no active target or the responder has already landed,
+    // so the lines disappear the instant the search is cleared or the aircraft arrives.
+    val activeTargetAircraft = if (targetCoordinate != null && !hasLanded) interceptStatus?.aircraft else null
+
     // Frame the operational center + target whenever the target changes, or when the user
     // re-enters the app via the tracking notification (lzFocusRequestId bump) even if the
     // target coordinate itself hasn't changed since they left.
@@ -265,9 +272,15 @@ fun RadarScreen(viewModel: AirMedRadarViewModel, modifier: Modifier = Modifier) 
                 ) {
                     aircraft.forEach { ac ->
                         key(ac.icao) {
-                            AircraftHistoryTrail(aircraft = ac)
-                            targetCoordinate?.let { target ->
-                                DestinationProjectionLine(aircraft = ac, target = target)
+                            // Strict gate: only the confirmed responding aircraft gets a
+                            // breadcrumb trail or a projection line. Every other aircraft —
+                            // including one the dispatcher merely tapped for details — renders
+                            // as a clean icon with no trailing paths.
+                            if (ac.icao == activeTargetAircraft?.icao) {
+                                AircraftHistoryTrail(aircraft = ac)
+                                targetCoordinate?.let { target ->
+                                    DestinationProjectionLine(aircraft = ac, target = target)
+                                }
                             }
                             AircraftMarker(
                                 aircraft = ac,
