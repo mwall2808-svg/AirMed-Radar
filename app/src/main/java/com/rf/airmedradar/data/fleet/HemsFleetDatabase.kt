@@ -41,8 +41,8 @@ private object SeedFactoryBaselineCallback : RoomDatabase.Callback() {
     override fun onCreate(db: SupportSQLiteDatabase) {
         super.onCreate(db)
         insertProvider(db, "UC Air Care", listOf("N145UC", "N84UC", "N874BU"))
-        insertProvider(db, "StatFlight", listOf("N401PH", "N402PH", "N403PH", "N320PH"))
-        insertProvider(db, "IU Health LifeLine", listOf("N192LL", "N194LL", "N273NE", "N193LL"))
+        insertProvider(db, "StatFlight", listOf("N401PH", "N402PH", "N403PH"))
+        insertProvider(db, "IU Health LifeLine", listOf("N192LL", "N194LL", "N273NE"))
         insertProvider(db, "Air Evac Lifeteam", listOf("N166AE", "N101AE", "N490AE"))
     }
 

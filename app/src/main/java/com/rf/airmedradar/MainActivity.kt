@@ -107,7 +107,7 @@ import com.google.maps.android.compose.rememberCameraPositionState
 import com.google.maps.android.compose.rememberUpdatedMarkerState
 import com.google.android.libraries.places.api.model.AutocompletePrediction
 import com.rf.airmedradar.data.Aircraft
-import com.rf.airmedradar.data.DiscoveredHemsProvider
+import com.rf.airmedradar.data.fleet.HemsProviderEntity
 import com.rf.airmedradar.data.fleet.parseTailNumbers
 import com.rf.airmedradar.service.AirMedTrackingService
 import com.rf.airmedradar.service.InterceptStatus
@@ -181,7 +181,7 @@ fun RadarScreen(viewModel: AirMedRadarViewModel, modifier: Modifier = Modifier) 
     val searchQuery by viewModel.searchQuery.collectAsStateWithLifecycle()
     val addressSuggestions by viewModel.addressSuggestions.collectAsStateWithLifecycle()
     val deviceLocation by viewModel.deviceLocation.collectAsStateWithLifecycle()
-    val discoveredProviders by viewModel.discoveredProviders.collectAsStateWithLifecycle()
+    val registeredProviders by viewModel.providers.collectAsStateWithLifecycle()
 
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
@@ -420,9 +420,9 @@ fun RadarScreen(viewModel: AirMedRadarViewModel, modifier: Modifier = Modifier) 
 
     if (showHemsSelectionDialog) {
         HemsProviderSelectionDialog(
-            providers = discoveredProviders,
+            providers = registeredProviders,
             onSelect = { provider ->
-                viewModel.selectDispatchedProvider(provider)
+                viewModel.selectProvider(provider)
                 showHemsSelectionDialog = false
             },
             onAddCustomProvider = {
@@ -445,16 +445,16 @@ fun RadarScreen(viewModel: AirMedRadarViewModel, modifier: Modifier = Modifier) 
 }
 
 /**
- * Pops the instant the camera finishes centering on a newly-resolved LZ, listing only the
- * HEMS operators [com.rf.airmedradar.data.discoverHemsProviders] actually sees airborne in the
- * current telemetry batch — never a fixed roster. The list is live: since [providers] is
- * collected straight from the ViewModel's StateFlow, a provider that appears or drops out of
- * range between polls updates this dialog in place while it's still open.
+ * Pops the instant the camera finishes centering on a newly-resolved LZ, listing every HEMS
+ * operator on file in the Phase 9.7 Room registry — factory baseline plus anything the
+ * dispatcher has entered as a custom provider (Phase 9.8) — so a provider added there shows up
+ * here the next time this dialog opens. Rows are deliberately large and single-tap: this is a
+ * pre-flight selection made in a hurry, not a detail screen.
  */
 @Composable
 private fun HemsProviderSelectionDialog(
-    providers: List<DiscoveredHemsProvider>,
-    onSelect: (DiscoveredHemsProvider) -> Unit,
+    providers: List<HemsProviderEntity>,
+    onSelect: (HemsProviderEntity) -> Unit,
     onAddCustomProvider: () -> Unit,
     onDismiss: () -> Unit,
 ) {
@@ -472,7 +472,7 @@ private fun HemsProviderSelectionDialog(
                     CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
                     Spacer(Modifier.width(12.dp))
                     Text(
-                        text = "Scanning local airspace for HEMS transponders…",
+                        text = "Loading registered providers…",
                         style = MaterialTheme.typography.bodyMedium,
                     )
                 }
@@ -480,7 +480,7 @@ private fun HemsProviderSelectionDialog(
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .heightIn(max = 320.dp)
+                        .heightIn(max = 360.dp)
                         .verticalScroll(rememberScrollState()),
                 ) {
                     providers.forEach { provider ->
@@ -488,12 +488,12 @@ private fun HemsProviderSelectionDialog(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .clickable { onSelect(provider) }
-                                .padding(vertical = 12.dp),
+                                .padding(vertical = 18.dp),
                         ) {
-                            Text(text = provider.name, style = MaterialTheme.typography.bodyLarge)
+                            Text(text = provider.providerName, style = MaterialTheme.typography.titleMedium)
                             Text(
                                 text = provider.tailNumbers.joinToString(", "),
-                                style = MaterialTheme.typography.bodySmall,
+                                style = MaterialTheme.typography.bodyMedium,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
                         }
@@ -504,9 +504,7 @@ private fun HemsProviderSelectionDialog(
         confirmButton = {
             TextButton(onClick = onDismiss) { Text("Cancel") }
         },
-        // Not the aircraft actually responding to this dispatch — a way out to the Phase 9.8
-        // entry screen for a provider that simply isn't in the live telemetry-derived list
-        // above (wrong type code, transponder off, out of the poll radius, etc.).
+        // A way out to the Phase 9.8 entry screen for an operator that simply isn't on file yet.
         dismissButton = {
             TextButton(onClick = onAddCustomProvider) { Text("Add Custom Provider") }
         },

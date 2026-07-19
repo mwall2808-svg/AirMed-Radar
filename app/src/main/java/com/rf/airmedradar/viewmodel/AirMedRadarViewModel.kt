@@ -101,25 +101,35 @@ class AirMedRadarViewModel(application: Application) : AndroidViewModel(applicat
     private val _selectedAircraft = MutableStateFlow<Aircraft?>(null)
     val selectedAircraft: StateFlow<Aircraft?> = _selectedAircraft.asStateFlow()
 
-    /**
-     * The primary tracking state flag: which provider the dispatcher confirmed as the actual
-     * responding unit from the HEMS selection dialog, and the tail numbers that dispatch
-     * covers. Null until a provider is picked; [clearTarget] resets it alongside the LZ itself
-     * since a cleared target has no responding unit to speak of.
-     */
-    private val _dispatchedProvider = MutableStateFlow<DiscoveredHemsProvider?>(null)
-    val dispatchedProvider: StateFlow<DiscoveredHemsProvider?> = _dispatchedProvider.asStateFlow()
-
-    /** Dispatcher confirmed [provider] as the responding unit from the HEMS selection dialog. */
-    fun selectDispatchedProvider(provider: DiscoveredHemsProvider) {
-        _dispatchedProvider.value = provider
-    }
-
-    // --- Custom provider management: appends a dispatcher-entered operator to the Phase 9.7
-    // national fleet registry. Kept separate from [discoveredProviders]/[dispatchedProvider]
-    // above — this writes to the persisted Room baseline, not the live per-poll ADS-B list. ---
+    // --- Pre-flight provider selection: sourced from the Phase 9.7 Room registry (factory
+    // baseline + anything the dispatcher has entered as a custom provider), not the live
+    // per-poll ADS-B discovery above — [discoveredProviders] answers "who's actually airborne
+    // right now," while this answers "which registered operator is dispatched to this LZ." ---
 
     private val hemsProviderDao = HemsFleetDatabase.getInstance(application).hemsProviderDao()
+
+    /** Every known HEMS operator on file, factory-seeded or dispatcher-entered — reactive,
+     *  since [HemsProviderDao.getAllProviders] is backed by a Room [kotlinx.coroutines.flow.Flow]. */
+    val providers: StateFlow<List<HemsProviderEntity>> =
+        hemsProviderDao.getAllProviders().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    /** The primary tracking state flag: the tail numbers of the provider the dispatcher
+     *  confirmed as the actual responding unit from the pre-flight selection popup. Empty
+     *  until a provider is picked; [clearTarget] resets it alongside the LZ itself since a
+     *  cleared target has no responding unit to speak of. */
+    private val _activeWatchList = MutableStateFlow<List<String>>(emptyList())
+    val activeWatchList: StateFlow<List<String>> = _activeWatchList.asStateFlow()
+
+    /** Whether a provider has been dispatched and its tail numbers are actively being watched
+     *  for in incoming telemetry. */
+    private val _isSearching = MutableStateFlow(false)
+    val isSearching: StateFlow<Boolean> = _isSearching.asStateFlow()
+
+    /** Dispatcher confirmed [provider] as the responding unit from the selection popup. */
+    fun selectProvider(provider: HemsProviderEntity) {
+        _activeWatchList.value = provider.tailNumbers
+        _isSearching.value = true
+    }
 
     /**
      * Inserts a dispatcher-entered operator as a custom row (`isCustom = true`), distinguishing
@@ -252,7 +262,8 @@ class AirMedRadarViewModel(application: Application) : AndroidViewModel(applicat
         _searchQuery.value = ""
         _addressSuggestions.value = emptyList()
         sessionToken = AutocompleteSessionToken.newInstance()
-        _dispatchedProvider.value = null
+        _activeWatchList.value = emptyList()
+        _isSearching.value = false
     }
 
     override fun onCleared() {
