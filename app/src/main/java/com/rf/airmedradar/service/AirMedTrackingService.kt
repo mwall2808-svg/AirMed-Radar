@@ -24,6 +24,8 @@ import com.rf.airmedradar.data.NetworkUtils
 import com.rf.airmedradar.data.discoverHemsProviders
 import com.rf.airmedradar.data.isRotorcraft
 import com.rf.airmedradar.util.formatEtaSeconds
+import com.rf.airmedradar.util.initialBearingDegrees
+import com.rf.airmedradar.util.isOnTrajectoryToTarget
 import java.io.IOException
 import java.net.SocketTimeoutException
 import java.net.UnknownHostException
@@ -73,6 +75,8 @@ class AirMedTrackingService : Service() {
     private val _hasLanded = MutableStateFlow(false)
     private val _deviceLocation = MutableStateFlow<LatLng?>(null)
     private val _discoveredProviders = MutableStateFlow<List<DiscoveredHemsProvider>>(emptyList())
+    private val _activeWatchList = MutableStateFlow<List<String>>(emptyList())
+    private val _isTargetLocked = MutableStateFlow(false)
 
     private val telemetrySnapshot: StateFlow<TrackingSnapshot> = combine(
         _liveAircraft,
@@ -95,8 +99,16 @@ class AirMedTrackingService : Service() {
         telemetrySnapshot,
         _deviceLocation,
         _discoveredProviders,
-    ) { base, location, providers ->
-        base.copy(deviceLocation = location, discoveredProviders = providers)
+        _activeWatchList,
+        _isTargetLocked,
+    ) { base, location, providers, watchList, targetLocked ->
+        base.copy(
+            deviceLocation = location,
+            discoveredProviders = providers,
+            activeWatchList = watchList,
+            isSearching = watchList.isNotEmpty(),
+            isTargetLocked = targetLocked,
+        )
     }.stateIn(serviceScope, SharingStarted.Eagerly, TrackingSnapshot())
 
     /**
@@ -146,7 +158,27 @@ class AirMedTrackingService : Service() {
         _hasLanded.value = false
         hasFiredInboundAlert = false
         previousTargetDistanceNm.clear()
+        clearActiveWatchList()
         postNotificationSafely(TRACKING_NOTIFICATION_ID, buildTrackingNotification())
+    }
+
+    /**
+     * Dispatcher confirmed a provider from the pre-flight selection popup: the very next poll
+     * tail-locks onto exactly these registrations instead of the default rotorcraft-category
+     * filter — see [refreshAircraft]. Uppercased since ADS-B registrations are broadcast
+     * upper-case and the Room-stored tail numbers already are too, but this is the one place
+     * that actually matches them against live telemetry, so it shouldn't rely on every caller
+     * having normalized case correctly upstream.
+     */
+    fun setActiveWatchList(tailNumbers: List<String>) {
+        _activeWatchList.value = tailNumbers.map { it.uppercase() }
+        _isTargetLocked.value = false
+    }
+
+    /** Reverts to showing every rotorcraft in range instead of a tail-locked fleet. */
+    fun clearActiveWatchList() {
+        _activeWatchList.value = emptyList()
+        _isTargetLocked.value = false
     }
 
     /** Non-null once the recurring poll ticker has been started for this session — see
@@ -197,6 +229,7 @@ class AirMedTrackingService : Service() {
         _interceptStatus.value = null
         _hasLanded.value = false
         _discoveredProviders.value = emptyList()
+        clearActiveWatchList()
     }
 
     /**
@@ -216,14 +249,24 @@ class AirMedTrackingService : Service() {
                 lon = center.longitude,
                 radiusNm = TRACKING_RADIUS_NM,
             )
-            val rotorcraft = fetched.filter { it.hasPosition && it.isRotorcraft() }
-            val withHistory = attachHistory(rotorcraft)
+            val watchList = _activeWatchList.value
+            val candidates = if (watchList.isNotEmpty()) {
+                // Tail-lock filter: once a provider has been dispatched, completely ignore
+                // every other aircraft in the sky — including other rotorcraft — and isolate
+                // strictly by registration membership in the dispatcher's confirmed fleet.
+                fetched.filter { it.hasPosition && it.registration?.uppercase() in watchList }
+            } else {
+                fetched.filter { it.hasPosition && it.isRotorcraft() }
+            }
+            val validated = if (watchList.isNotEmpty()) applyTrajectoryGate(candidates) else candidates
+
+            val withHistory = attachHistory(validated)
             _liveAircraft.value = withHistory
             _isOffline.value = false
             updateInterceptStatus(withHistory)
-            // Runs against the full bounding-box batch, not just `rotorcraft` above — ICAO
-            // type-code discovery is an independent classification from the isRotorcraft()
-            // category/callsign heuristic and shouldn't be narrowed by it.
+            // Runs against the full bounding-box batch, not just `candidates`/`validated` above
+            // — ICAO type-code discovery is an independent classification from the tail-lock/
+            // isRotorcraft() filters and shouldn't be narrowed by either.
             _discoveredProviders.value = discoverHemsProviders(fetched)
         } catch (e: UnknownHostException) {
             Log.w(TAG, "adsb.lol unreachable (no DNS/connectivity) — retaining last known positions", e)
@@ -240,6 +283,33 @@ class AirMedTrackingService : Service() {
             Log.e(TAG, "Unexpected error refreshing aircraft telemetry", e)
             _isOffline.value = true
         }
+    }
+
+    /**
+     * Trigonometric vector validation gate: for each tail-locked [candidates] aircraft,
+     * calculates the great-circle bearing from its current position to the LZ and compares it
+     * against the aircraft's own live ADS-B heading ([Aircraft.track]). Only aircraft actually
+     * flying toward this LZ (within [com.rf.airmedradar.util.TRAJECTORY_WINDOW_DEGREES]) pass —
+     * an identical-fleet aircraft handling an unrelated run elsewhere is rejected outright and
+     * never reaches [_liveAircraft]/the map UI. [_isTargetLocked] reflects whether at least one
+     * candidate passed this tick; aircraft missing position/heading data can't be evaluated and
+     * are rejected rather than assumed valid.
+     */
+    private fun applyTrajectoryGate(candidates: List<Aircraft>): List<Aircraft> {
+        val target = _targetCoordinate.value
+        if (target == null) {
+            _isTargetLocked.value = false
+            return emptyList()
+        }
+        val validated = candidates.filter { ac ->
+            val lat = ac.lat ?: return@filter false
+            val lon = ac.lon ?: return@filter false
+            val track = ac.track ?: return@filter false
+            val bearingToTarget = initialBearingDegrees(LatLng(lat, lon), target)
+            isOnTrajectoryToTarget(aircraftTrackDegrees = track, bearingToTargetDegrees = bearingToTarget)
+        }
+        _isTargetLocked.value = validated.isNotEmpty()
+        return validated
     }
 
     /**

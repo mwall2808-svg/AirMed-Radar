@@ -113,22 +113,27 @@ class AirMedRadarViewModel(application: Application) : AndroidViewModel(applicat
     val providers: StateFlow<List<HemsProviderEntity>> =
         hemsProviderDao.getAllProviders().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
-    /** The primary tracking state flag: the tail numbers of the provider the dispatcher
-     *  confirmed as the actual responding unit from the pre-flight selection popup. Empty
-     *  until a provider is picked; [clearTarget] resets it alongside the LZ itself since a
-     *  cleared target has no responding unit to speak of. */
-    private val _activeWatchList = MutableStateFlow<List<String>>(emptyList())
-    val activeWatchList: StateFlow<List<String>> = _activeWatchList.asStateFlow()
+    /** The primary tracking state flag: the tail numbers the dispatcher confirmed as the
+     *  actual responding unit from the pre-flight selection popup. Sourced straight from the
+     *  Service's snapshot (not local ViewModel state) since the Service's poll loop is what
+     *  actually applies the tail-lock filter — this is a read-only mirror of its state. */
+    val activeWatchList: StateFlow<List<String>> =
+        snapshot.map { it.activeWatchList }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
     /** Whether a provider has been dispatched and its tail numbers are actively being watched
-     *  for in incoming telemetry. */
-    private val _isSearching = MutableStateFlow(false)
-    val isSearching: StateFlow<Boolean> = _isSearching.asStateFlow()
+     *  for in incoming telemetry — derived by the Service as `activeWatchList.isNotEmpty()`. */
+    val isSearching: StateFlow<Boolean> =
+        snapshot.map { it.isSearching }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), false)
 
-    /** Dispatcher confirmed [provider] as the responding unit from the selection popup. */
+    /** Whether at least one tail-locked aircraft passed the Service's trigonometric
+     *  trajectory validation gate this poll — see [AirMedTrackingService.applyTrajectoryGate]. */
+    val isTargetLocked: StateFlow<Boolean> =
+        snapshot.map { it.isTargetLocked }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), false)
+
+    /** Dispatcher confirmed [provider] as the responding unit from the selection popup: tells
+     *  the Service to tail-lock its next poll onto exactly this fleet's registrations. */
     fun selectProvider(provider: HemsProviderEntity) {
-        _activeWatchList.value = provider.tailNumbers
-        _isSearching.value = true
+        _boundService.value?.setActiveWatchList(provider.tailNumbers)
     }
 
     /**
@@ -258,12 +263,11 @@ class AirMedRadarViewModel(application: Application) : AndroidViewModel(applicat
     }
 
     fun clearTarget() {
+        // Also clears the Service's tail-lock watch list — see AirMedTrackingService.clearTarget().
         _boundService.value?.clearTarget()
         _searchQuery.value = ""
         _addressSuggestions.value = emptyList()
         sessionToken = AutocompleteSessionToken.newInstance()
-        _activeWatchList.value = emptyList()
-        _isSearching.value = false
     }
 
     override fun onCleared() {
