@@ -16,9 +16,6 @@ import com.google.android.libraries.places.api.model.AutocompleteSessionToken
 import com.rf.airmedradar.data.Aircraft
 import com.rf.airmedradar.data.PlacesAutocompleteRepository
 import com.rf.airmedradar.data.WeatherRepository
-import com.rf.airmedradar.data.profile.AppDatabase
-import com.rf.airmedradar.data.profile.ProfileRepository
-import com.rf.airmedradar.data.profile.UserProfile
 import com.rf.airmedradar.service.AirMedTrackingService
 import com.rf.airmedradar.service.InterceptStatus
 import com.rf.airmedradar.service.TrackingSnapshot
@@ -87,6 +84,11 @@ class AirMedRadarViewModel(application: Application) : AndroidViewModel(applicat
         snapshot.map { it.interceptStatus }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
     val hasLanded: StateFlow<Boolean> =
         snapshot.map { it.hasLanded }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), false)
+    /** The device's own live GPS fix — sourced from the Service (it already owns the single
+     *  [com.rf.airmedradar.data.LocationRepository] instance backing the ADS-B scan center),
+     *  republished here purely so the UI can snap its camera to it and bias Places search. */
+    val deviceLocation: StateFlow<LatLng?> =
+        snapshot.map { it.deviceLocation }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
 
     private val _selectedAircraft = MutableStateFlow<Aircraft?>(null)
     val selectedAircraft: StateFlow<Aircraft?> = _selectedAircraft.asStateFlow()
@@ -98,35 +100,11 @@ class AirMedRadarViewModel(application: Application) : AndroidViewModel(applicat
     private val _lzFocusRequestId = MutableStateFlow(0L)
     val lzFocusRequestId: StateFlow<Long> = _lzFocusRequestId.asStateFlow()
 
-    // --- Dynamic profile & geospatial scoping: the single source of truth for which region
-    // the tracking Service, weather monitor, and map camera are all scoped to. The Service
-    // holds its own [ProfileRepository] instance backed by the same Room DB singleton and
-    // reacts to profile switches independently — this ViewModel only needs to write the new
-    // active profile and re-scope its own weather polling / Places search bias off the same
-    // Flow, no direct signal to the Service required. ---
-
-    private val profileRepository = ProfileRepository(AppDatabase.getInstance(application).userProfileDao())
-
-    val activeProfile: StateFlow<UserProfile?> =
-        profileRepository.activeProfile.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
-    val profiles: StateFlow<List<UserProfile>> =
-        profileRepository.allProfiles.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
-
-    /** Dispatcher picked a different region from the profile switcher sheet. */
-    fun selectProfile(profileId: Long) {
-        // Mirrors clearTarget()'s local-search reset: a stale address query/target from the
-        // old region has no meaning once the map has jumped elsewhere.
-        _searchQuery.value = ""
-        _addressSuggestions.value = emptyList()
-        sessionToken = AutocompleteSessionToken.newInstance()
-        viewModelScope.launch { profileRepository.setActiveProfile(profileId) }
-    }
-
-    // --- HEMS weather minimums monitor: independent of the tracking Service/snapshot since
-    // it has nothing to do with aircraft telemetry, just the local METAR feed. Polls on its
-    // own 15-minute cadence — weather doesn't change fast enough to warrant the Service's
-    // much shorter aircraft-poll interval, and a failed fetch simply skips that tick, leaving
-    // the last-known-good evaluation on screen rather than clearing it. ---
+    // --- HEMS weather minimums monitor: independent of the tracking Service/snapshot's
+    // telemetry state, but scoped off the same [deviceLocation] GPS fix the Service publishes.
+    // Polls on its own 15-minute cadence — weather doesn't change fast enough to warrant the
+    // Service's much shorter aircraft-poll interval, and a failed fetch simply skips that tick,
+    // leaving the last-known-good evaluation on screen rather than clearing it. ---
 
     private val weatherRepository = WeatherRepository()
 
@@ -138,22 +116,29 @@ class AirMedRadarViewModel(application: Application) : AndroidViewModel(applicat
     }
 
     /**
-     * Same `collectLatest`-on-the-profile-Flow trick as the Service's polling loop: switching
-     * regions cancels whatever delay the previous station's loop was mid-way through, clears
-     * the now-stale evaluation so the banner disappears rather than showing the old region's
-     * numbers, and immediately fetches the new station — no separate "force refresh" call needed.
+     * Resolves the device fix to its nearest major METAR station and re-derives whenever that
+     * *resolved station* changes — not on every GPS tick, which would otherwise flicker the
+     * banner on ordinary position jitter even though the dispatcher hasn't gone anywhere
+     * meaningful. `collectLatest` cancels whatever delay the previous station's loop was
+     * mid-way through the moment the device crosses into a new station's catchment, clears the
+     * now-stale evaluation so the banner disappears rather than showing the old area's numbers,
+     * and immediately fetches the new station — no separate "force refresh" call needed.
      */
     private fun observeWeatherMinimums() {
         viewModelScope.launch {
-            activeProfile.filterNotNull().collectLatest { profile ->
-                _weatherEvaluation.value = null
-                while (isActive) {
-                    weatherRepository.fetchLatestMetar(profile.metarStationId)?.let { observation ->
-                        _weatherEvaluation.value = evaluateFlightStatus(observation)
+            deviceLocation
+                .filterNotNull()
+                .map { weatherRepository.resolveNearestStationId(it.latitude, it.longitude) }
+                .distinctUntilChanged()
+                .collectLatest { stationId ->
+                    _weatherEvaluation.value = null
+                    while (isActive) {
+                        weatherRepository.fetchLatestMetar(stationId)?.let { observation ->
+                            _weatherEvaluation.value = evaluateFlightStatus(observation)
+                        }
+                        delay(WEATHER_POLL_INTERVAL_MS)
                     }
-                    delay(WEATHER_POLL_INTERVAL_MS)
                 }
-            }
         }
     }
 
@@ -198,8 +183,7 @@ class AirMedRadarViewModel(application: Application) : AndroidViewModel(applicat
                     _addressSuggestions.value = if (query.isBlank() || placesRepository == null) {
                         emptyList()
                     } else {
-                        val bias = activeProfile.value?.let { LatLng(it.centerLat, it.centerLon) }
-                            ?: FALLBACK_OPERATIONAL_CENTER
+                        val bias = deviceLocation.value ?: FALLBACK_OPERATIONAL_CENTER
                         placesRepository.fetchPredictions(query, sessionToken, bias)
                     }
                 }

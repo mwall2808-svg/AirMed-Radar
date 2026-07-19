@@ -18,26 +18,23 @@ import com.rf.airmedradar.R
 import com.rf.airmedradar.data.AdsbRepository
 import com.rf.airmedradar.data.Aircraft
 import com.rf.airmedradar.data.GeocodingService
+import com.rf.airmedradar.data.LocationRepository
 import com.rf.airmedradar.data.NetworkUtils
 import com.rf.airmedradar.data.isRotorcraft
-import com.rf.airmedradar.data.profile.AppDatabase
-import com.rf.airmedradar.data.profile.ProfileRepository
-import com.rf.airmedradar.data.profile.UserProfile
 import com.rf.airmedradar.util.formatEtaSeconds
 import java.io.IOException
 import java.net.SocketTimeoutException
 import java.net.UnknownHostException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
-import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -65,16 +62,16 @@ class AirMedTrackingService : Service() {
     private val serviceScope = CoroutineScope(Dispatchers.Default + serviceJob)
 
     private val repository = AdsbRepository()
-    private val profileRepository by lazy { ProfileRepository(AppDatabase.getInstance(applicationContext).userProfileDao()) }
+    private val locationRepository by lazy { LocationRepository(applicationContext) }
 
     private val _liveAircraft = MutableStateFlow<List<Aircraft>>(emptyList())
     private val _isOffline = MutableStateFlow(false)
     private val _targetCoordinate = MutableStateFlow<LatLng?>(null)
     private val _interceptStatus = MutableStateFlow<InterceptStatus?>(null)
     private val _hasLanded = MutableStateFlow(false)
+    private val _deviceLocation = MutableStateFlow<LatLng?>(null)
 
-    /** Single source of truth for the UI — everything it needs to render in one flow. */
-    val snapshot: StateFlow<TrackingSnapshot> = combine(
+    private val telemetrySnapshot: StateFlow<TrackingSnapshot> = combine(
         _liveAircraft,
         _isOffline,
         _targetCoordinate,
@@ -88,6 +85,11 @@ class AirMedTrackingService : Service() {
             interceptStatus = intercept,
             hasLanded = landed,
         )
+    }.stateIn(serviceScope, SharingStarted.Eagerly, TrackingSnapshot())
+
+    /** Single source of truth for the UI — everything it needs to render in one flow. */
+    val snapshot: StateFlow<TrackingSnapshot> = combine(telemetrySnapshot, _deviceLocation) { base, location ->
+        base.copy(deviceLocation = location)
     }.stateIn(serviceScope, SharingStarted.Eagerly, TrackingSnapshot())
 
     /**
@@ -140,32 +142,46 @@ class AirMedTrackingService : Service() {
         postNotificationSafely(TRACKING_NOTIFICATION_ID, buildTrackingNotification())
     }
 
+    /** Non-null once the recurring poll ticker has been started for this session — see
+     *  [startPollingLoop]. Its null-ness, not the location itself, is what distinguishes "a
+     *  genuine fresh lock" from "routine GPS refinement while already tracking." */
+    private var pollTicker: Job? = null
+
     /**
-     * Drives polling off the active region Flow rather than a fixed schedule: `collectLatest`
-     * cancels the previous region's while-loop (including whatever `delay` it was mid-way
-     * through) the instant a new profile becomes active, resets the stale region's state, and
-     * immediately runs a fresh poll for the new one — no separate "force refresh" signal is
-     * needed, and the normal [POLL_INTERVAL_MS] cadence simply resumes for the new region.
+     * Bootstraps entirely off the device's own GPS fix rather than any fixed/dispatcher-picked
+     * region: [LocationRepository.observeLocation] supplies a cached fix immediately (never a
+     * bogus (0,0) placeholder) and live high-accuracy updates thereafter. The *first* fix this
+     * Service ever sees is a genuine fresh lock — it clears any state left behind by a previous
+     * run and starts the recurring poll ticker. Every fix after that just updates
+     * [_deviceLocation] in place for the ticker to read on its next cycle: ordinary GPS
+     * refinement while already tracking must not keep re-clearing the map every ~30s.
      */
     private fun startPollingLoop() {
         serviceScope.launch {
-            profileRepository.activeProfile.filterNotNull().collectLatest { profile ->
-                resetForNewProfile()
-                while (isActive) {
-                    refreshAircraft(profile)
-                    tick()
-                    delay(POLL_INTERVAL_MS)
+            locationRepository.observeLocation().collect { location ->
+                _deviceLocation.value = LatLng(location.latitude, location.longitude)
+                if (pollTicker == null) {
+                    resetForFreshLock()
+                    pollTicker = serviceScope.launch {
+                        while (isActive) {
+                            _deviceLocation.value?.let { center ->
+                                refreshAircraft(center)
+                                tick()
+                            }
+                            delay(POLL_INTERVAL_MS)
+                        }
+                    }
                 }
             }
         }
     }
 
     /**
-     * Clears every piece of per-region state that would otherwise leak across a profile
-     * switch: last-known aircraft (so a stale Cincinnati marker never flashes over Houston),
-     * position trails, the active search target/intercept status, and alert edge-triggers.
+     * Clears every piece of state that would otherwise leak from a previous session: stale
+     * aircraft/flight-path lines, position trails, the active search target/intercept status,
+     * and alert edge-triggers — run exactly once, the moment a fresh GPS lock is established.
      */
-    private fun resetForNewProfile() {
+    private fun resetForFreshLock() {
         aircraftHistory.clear()
         previousTargetDistanceNm.clear()
         hasFiredInboundAlert = false
@@ -176,11 +192,11 @@ class AirMedTrackingService : Service() {
     }
 
     /**
-     * Pulls the latest telemetry batch for [profile]. On any network failure, last-known
-     * aircraft positions are simply left in place (`_liveAircraft` is untouched) and the next
-     * scheduled tick retries cleanly — a dropped signal never crashes this service.
+     * Pulls the latest telemetry batch scoped around [center]. On any network failure,
+     * last-known aircraft positions are simply left in place (`_liveAircraft` is untouched) and
+     * the next scheduled tick retries cleanly — a dropped signal never crashes this service.
      */
-    private suspend fun refreshAircraft(profile: UserProfile) {
+    private suspend fun refreshAircraft(center: LatLng) {
         if (!NetworkUtils.isOnline(applicationContext)) {
             _isOffline.value = true
             Log.w(TAG, "Skipping poll: device reports no active network")
@@ -188,9 +204,9 @@ class AirMedTrackingService : Service() {
         }
         try {
             val fetched = repository.fetchAircraftNear(
-                lat = profile.centerLat,
-                lon = profile.centerLon,
-                radiusNm = profile.radiusNM,
+                lat = center.latitude,
+                lon = center.longitude,
+                radiusNm = TRACKING_RADIUS_NM,
             )
             val rotorcraft = fetched.filter { it.hasPosition && it.isRotorcraft() }
             val withHistory = attachHistory(rotorcraft)
@@ -401,6 +417,7 @@ class AirMedTrackingService : Service() {
         private const val ALERT_NOTIFICATION_ID = 1002
         private const val OPEN_APP_REQUEST_CODE = 2001
 
+        private const val TRACKING_RADIUS_NM = 75
         private const val POLL_INTERVAL_MS = 12_000L
         private const val METERS_PER_NAUTICAL_MILE = 1852.0
         private const val LANDING_THRESHOLD_NM = 0.3

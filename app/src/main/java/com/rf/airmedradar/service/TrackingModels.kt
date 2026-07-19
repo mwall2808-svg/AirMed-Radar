@@ -17,4 +17,6 @@ data class TrackingSnapshot(
     val targetCoordinate: LatLng? = null,
     val interceptStatus: InterceptStatus? = null,
     val hasLanded: Boolean = false,
+    /** The device's own GPS fix — null until the first one arrives; see [AirMedTrackingService]. */
+    val deviceLocation: LatLng? = null,
 )
