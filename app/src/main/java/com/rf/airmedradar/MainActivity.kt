@@ -4,6 +4,8 @@ import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.location.Location
 import android.os.Build
 import android.os.Bundle
@@ -59,13 +61,18 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.core.graphics.drawable.DrawableCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.google.android.gms.maps.CameraUpdateFactory
+import com.google.android.gms.maps.model.BitmapDescriptor
 import com.google.android.gms.maps.model.BitmapDescriptorFactory
 import com.google.android.gms.maps.model.CameraPosition
 import com.google.android.gms.maps.model.Dash
@@ -309,6 +316,10 @@ fun RadarScreen(viewModel: AirMedRadarViewModel, modifier: Modifier = Modifier) 
     }
 }
 
+private val AIRCRAFT_ICON_COLOR = Color(0xFF2979FF) // azure
+private val AIRCRAFT_ICON_COLOR_SELECTED = Color(0xFFFFD600) // yellow
+private val AIRCRAFT_ICON_SIZE = 40.dp
+
 @Composable
 private fun AircraftMarker(aircraft: Aircraft, isSelected: Boolean, onClick: () -> Unit) {
     val position = aircraft.currentCoordinates ?: return
@@ -317,15 +328,23 @@ private fun AircraftMarker(aircraft: Aircraft, isSelected: Boolean, onClick: () 
     val altitudeLabel = aircraft.altitudeFeet?.let { "$it ft" } ?: "Alt N/A"
     val speedLabel = aircraft.groundSpeedKts?.let { "${it.toInt()} kt" } ?: "GS N/A"
 
-    val hue = if (isSelected) BitmapDescriptorFactory.HUE_YELLOW else BitmapDescriptorFactory.HUE_AZURE
+    val tint = if (isSelected) AIRCRAFT_ICON_COLOR_SELECTED else AIRCRAFT_ICON_COLOR
+    val icon = rememberHelicopterBitmapDescriptor(tint = tint)
 
     Marker(
         state = markerState,
-        // Rotates the icon to match true track over the ground.
+        // The Maps SDK rotates the icon bitmap around `anchor` natively and efficiently —
+        // there is no need to (and we must not) also pre-rotate the bitmap ourselves via a
+        // Canvas Matrix transform, or the icon would be rotated twice.
         rotation = aircraft.safeTrackDegrees,
+        // `flat = true` pins the icon to the map plane so its rotation tracks true heading
+        // as the map itself is panned/rotated/tilted, instead of always facing the camera.
         flat = true,
+        // Centers the rotation axis on the icon's physical center rather than the default
+        // bottom-center pin-tip — required for a vehicle icon, or it swings like a weather
+        // vane around a point well below its actual body.
         anchor = Offset(0.5f, 0.5f),
-        icon = BitmapDescriptorFactory.defaultMarker(hue),
+        icon = icon,
         title = aircraft.displayName,
         snippet = "$altitudeLabel • $speedLabel",
         onClick = {
@@ -333,6 +352,46 @@ private fun AircraftMarker(aircraft: Aircraft, isSelected: Boolean, onClick: () 
             true
         },
     )
+}
+
+/**
+ * Converts `ic_helicopter` into a tinted [BitmapDescriptor] sized for the map, generated via
+ * an off-screen [Canvas] rather than [BitmapDescriptorFactory.fromResource] — the latter
+ * doesn't reliably respect a vector drawable's intended density scaling on every API level,
+ * which is the actual cause of the icon-quality issue this replaces. Result is memoized per
+ * [tint]: there are only ever two distinct tints in practice (selected / not), so this runs
+ * at most twice per composition, never on every telemetry tick or recomposition.
+ */
+@Composable
+private fun rememberHelicopterBitmapDescriptor(
+    tint: Color,
+    sizeDp: Dp = AIRCRAFT_ICON_SIZE,
+): BitmapDescriptor {
+    val context = LocalContext.current
+    val density = LocalDensity.current
+    return remember(tint, sizeDp) {
+        val sizePx = with(density) { sizeDp.roundToPx() }.coerceAtLeast(1)
+        vectorDrawableToBitmapDescriptor(context, R.drawable.ic_helicopter, tint.toArgb(), sizePx)
+    }
+}
+
+private fun vectorDrawableToBitmapDescriptor(
+    context: Context,
+    drawableRes: Int,
+    tintColor: Int,
+    sizePx: Int,
+): BitmapDescriptor {
+    val source = requireNotNull(ContextCompat.getDrawable(context, drawableRes)) {
+        "Missing drawable resource $drawableRes"
+    }
+    val drawable = DrawableCompat.wrap(source).mutate()
+    DrawableCompat.setTint(drawable, tintColor)
+    drawable.setBounds(0, 0, sizePx, sizePx)
+
+    val bitmap = Bitmap.createBitmap(sizePx, sizePx, Bitmap.Config.ARGB_8888)
+    drawable.draw(Canvas(bitmap))
+
+    return BitmapDescriptorFactory.fromBitmap(bitmap)
 }
 
 /** Historical position trail: renders once the aircraft has at least two recorded points. */
