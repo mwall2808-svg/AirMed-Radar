@@ -207,6 +207,11 @@ class AirMedTrackingService : Service() {
         super.onTaskRemoved(rootIntent)
         if (!isMissionActive.value) {
             Log.d(HEMS_LOG_TAG, "[MISSION] onTaskRemoved with no active mission — stopping service")
+            // Redundant with demoteFromForeground() in the normal case (it already ran the
+            // moment isMissionActive went false) — cheap, explicit insurance against this task
+            // removal somehow being the first place that's noticed idle, rather than relying on
+            // that prior transition having fired correctly.
+            NotificationManagerCompat.from(this).cancelAll()
             stopSelf()
         }
     }
@@ -328,13 +333,21 @@ class AirMedTrackingService : Service() {
         startForeground(TRACKING_NOTIFICATION_ID, buildTrackingNotification())
     }
 
-    /** Drops out of the foreground state and clears every notification this service owns — the
-     *  ongoing tracking one and any still-visible alert — so an idle app leaves nothing behind
-     *  in the shade, matching the zero ongoing background work behind it. */
+    /**
+     * Drops out of the foreground state and clears every notification this app owns via
+     * `cancelAll()` — not two individual `cancel(id)` calls — so an idle app leaves nothing
+     * behind in the shade, guaranteed, even if a future notification type is added here and
+     * someone forgets to list its ID alongside these two. Also calls [stopSelf] explicitly:
+     * harmless no-op if [AirMedRadarViewModel][com.rf.airmedradar.viewmodel.AirMedRadarViewModel]
+     * still has this instance bound (Android defers actual teardown until the last unbind
+     * either way), but it correctly relinquishes the "started" state [promoteToForeground]'s
+     * `startForeground()` call put this service into — a started service is responsible for
+     * stopping itself once its work is done, and idle is exactly that moment.
+     */
     private fun demoteFromForeground() {
         stopForeground(STOP_FOREGROUND_REMOVE)
-        NotificationManagerCompat.from(this).cancel(TRACKING_NOTIFICATION_ID)
-        NotificationManagerCompat.from(this).cancel(ALERT_NOTIFICATION_ID)
+        NotificationManagerCompat.from(this).cancelAll()
+        stopSelf()
     }
 
     /**
