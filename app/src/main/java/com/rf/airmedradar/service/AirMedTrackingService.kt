@@ -322,12 +322,20 @@ class AirMedTrackingService : Service() {
         } else {
             combined.filter { it.hasPosition && it.isRotorcraft() }
         }
-        val validated = if (watchList.isNotEmpty()) applyTrajectoryGate(candidates) else candidates
+        // Trajectory lock is evaluated but no longer decides what renders — a tail-locked
+        // aircraft that's parked on the pad or outbound on an unrelated heading must still show
+        // up on the map. Only the ETA card / vector line care whether it's actually inbound.
+        val locked = if (watchList.isNotEmpty()) {
+            evaluateTrajectoryLock(candidates)
+        } else {
+            _isTargetLocked.value = false
+            emptyList()
+        }
 
-        val withHistory = attachHistory(validated)
+        val withHistory = attachHistory(candidates)
         _liveAircraft.value = withHistory
         updateInterceptStatus(withHistory)
-        _etaSeconds.value = if (watchList.isNotEmpty()) computeLockedTargetEta(withHistory) else null
+        _etaSeconds.value = if (watchList.isNotEmpty()) computeLockedTargetEta(locked) else null
         // Runs against the full combined batch, not just `candidates`/`validated` above — ICAO
         // type-code discovery is an independent classification from the tail-lock/
         // isRotorcraft() filters and shouldn't be narrowed by either.
@@ -360,16 +368,18 @@ class AirMedTrackingService : Service() {
     }
 
     /**
-     * Trigonometric vector validation gate: for each tail-locked [candidates] aircraft,
-     * calculates the great-circle bearing from its current position to the LZ and compares it
-     * against the aircraft's own live ADS-B heading ([Aircraft.track]). Only aircraft actually
-     * flying toward this LZ (within [com.rf.airmedradar.util.TRAJECTORY_WINDOW_DEGREES]) pass —
-     * an identical-fleet aircraft handling an unrelated run elsewhere is rejected outright and
-     * never reaches [_liveAircraft]/the map UI. [_isTargetLocked] reflects whether at least one
-     * candidate passed this tick; aircraft missing position/heading data can't be evaluated and
-     * are rejected rather than assumed valid.
+     * Trigonometric vector validation: for each tail-locked [candidates] aircraft, calculates
+     * the great-circle bearing from its current position to the LZ and compares it against the
+     * aircraft's own live ADS-B heading ([Aircraft.track]). Only aircraft actually flying toward
+     * this LZ (within [com.rf.airmedradar.util.TRAJECTORY_WINDOW_DEGREES]) are considered
+     * "locked" — an identical-fleet aircraft handling an unrelated run elsewhere, or one still
+     * parked/outbound, doesn't count. [_isTargetLocked] reflects whether at least one candidate
+     * passed this tick; aircraft missing position/heading data can't be evaluated and are
+     * rejected rather than assumed valid. The returned subset drives the ETA card only — it no
+     * longer decides what renders on the map; every tail-locked candidate still reaches
+     * [_liveAircraft] regardless of this result (see [processBatch]).
      */
-    private fun applyTrajectoryGate(candidates: List<Aircraft>): List<Aircraft> {
+    private fun evaluateTrajectoryLock(candidates: List<Aircraft>): List<Aircraft> {
         val target = _targetCoordinate.value
         if (target == null) {
             _isTargetLocked.value = false
@@ -391,7 +401,7 @@ class AirMedTrackingService : Service() {
      * locked aircraft's current position to the LZ, divided by its groundspeed converted from
      * knots to meters/second (1 kt = 0.514444 m/s). Exclusively for a validated, trajectory-
      * gated target — [lockedAircraft] is expected to already be that filtered set, so this
-     * simply takes the first (closest, per [applyTrajectoryGate]'s upstream ordering) entry.
+     * simply takes the first (closest, per [evaluateTrajectoryLock]'s upstream ordering) entry.
      * Null whenever there's no locked aircraft, no LZ, or no usable position/speed reading.
      */
     private fun computeLockedTargetEta(lockedAircraft: List<Aircraft>): Long? {

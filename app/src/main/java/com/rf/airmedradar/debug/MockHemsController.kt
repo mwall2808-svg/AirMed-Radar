@@ -39,8 +39,15 @@ private const val START_BEARING_DEGREES = 300.0
  *  windows used anywhere in the app. */
 private const val AWAY_FROM_TARGET_OFFSET_DEGREES = 170.0
 
-private const val LIFT_OFF_GROUND_SPEED_KTS = 15.0
-private const val LIFT_OFF_ALTITUDE_FT = 50
+/** Fixed home-base helipad origin — University of Cincinnati Medical Center (FAA LID 8OH9,
+ *  University Hospital Helipad). STATE 1 (Avionics Init) and the initial frame of STATE 2
+ *  (Lift Off) always boot the synthetic aircraft here, rather than at the target-relative
+ *  [MockHemsController.startPosition] used by the later intercept/approach stages. */
+private val HOME_BASE_ORIGIN = LatLng(39.13728, -84.50272)
+
+private const val LIFT_OFF_GROUND_SPEED_KTS = 20.0
+private const val LIFT_OFF_ALTITUDE_FT = 100
+private const val LIFT_OFF_TICK_MS = 2_000L
 private const val INTERCEPT_GROUND_SPEED_KTS = 120.0
 private const val INTERCEPT_ALTITUDE_FT = 1_000
 private const val TERMINAL_APPROACH_TICK_MS = 2_000L
@@ -68,7 +75,7 @@ class MockHemsController(private val scope: CoroutineScope) {
 
     private var target: LatLng? = null
     private var startPosition: LatLng? = null
-    private var terminalApproachJob: Job? = null
+    private var movementJob: Job? = null
 
     private val _stage = MutableStateFlow(SimulationStage.COLD_AND_DARK)
     val stage: StateFlow<SimulationStage> = _stage.asStateFlow()
@@ -84,30 +91,30 @@ class MockHemsController(private val scope: CoroutineScope) {
     }
 
     fun advanceTo(newStage: SimulationStage) {
-        terminalApproachJob?.cancel()
+        movementJob?.cancel()
         _stage.value = newStage
         when (newStage) {
             // STATE 0: completely shut down — the telemetry stream has no entry at all for
             // this tail number, not a zeroed-out one.
             SimulationStage.COLD_AND_DARK -> _mockAircraft.value = null
 
-            // STATE 1: transponder on, broadcasting from the ramp — zero speed/altitude.
+            // STATE 1: transponder on, broadcasting from the ramp — zero speed/altitude, and
+            // always exactly at the UC Medical Center home-base pad, not a target-relative point.
+            // The map renders this marker unconditionally (tail-locked aircraft always render,
+            // regardless of trajectory lock — see AirMedTrackingService.processBatch); only the
+            // ETA card/vector line stay hidden, since isTargetLocked is false here.
             SimulationStage.AVIONICS_INIT -> _mockAircraft.value = buildAircraft(
                 groundSpeedKts = 0.0,
                 altitudeFeet = 0,
                 trackDegrees = 0.0,
-                position = startPosition,
+                position = HOME_BASE_ORIGIN,
             )
 
-            // STATE 2: airborne, but heading well outside any validation window — this is the
-            // "identical fleet aircraft on an unrelated run" case the trajectory gate exists
-            // to reject, so the ETA card must stay hidden here.
-            SimulationStage.LIFT_OFF -> _mockAircraft.value = buildAircraft(
-                groundSpeedKts = LIFT_OFF_GROUND_SPEED_KTS,
-                altitudeFeet = LIFT_OFF_ALTITUDE_FT,
-                trackDegrees = awayFromTargetBearing(),
-                position = startPosition,
-            )
+            // STATE 2: airborne and creeping away from the LZ — see startLiftOff(). Heading is
+            // well outside any validation window, the "identical fleet aircraft on an unrelated
+            // run" case the trajectory gate exists to reject, so the ETA card must stay hidden
+            // here even though the marker itself renders and moves.
+            SimulationStage.LIFT_OFF -> startLiftOff()
 
             // STATE 3: turned onto a heading pointing exactly at the LZ (0° deviation — well
             // inside both the 15° called for here and the app's actual 30° gate).
@@ -130,13 +137,41 @@ class MockHemsController(private val scope: CoroutineScope) {
         return initialBearingDegrees(position, destination)
     }
 
-    private fun awayFromTargetBearing(): Double = (towardTargetBearing() + AWAY_FROM_TARGET_OFFSET_DEGREES) % 360.0
+    /** Deliberately computed from [HOME_BASE_ORIGIN] — LIFT_OFF's actual starting position —
+     *  rather than [startPosition] (the unrelated LZ-relative point later stages start from).
+     *  Using the wrong reference point here would make the "away" bearing correct only by
+     *  coincidence of where the LZ happens to sit relative to [startPosition]; the trajectory
+     *  gate evaluates bearing-to-target from the aircraft's *real* position each tick, so this
+     *  must be anchored there too, or a nearby LZ can spuriously fall inside the lock window. */
+    private fun awayFromHomeBearing(): Double {
+        val destination = target ?: return 0.0
+        val homeBearingToTarget = initialBearingDegrees(HOME_BASE_ORIGIN, destination)
+        return (homeBearingToTarget + AWAY_FROM_TARGET_OFFSET_DEGREES) % 360.0
+    }
+
+    /** Lifts off from the home-base pad and creeps outbound on [awayFromHomeBearing] forever
+     *  — there's no arrival condition, unlike [startTerminalApproach]; this stage just needs to
+     *  visibly move until the next button press cancels [movementJob]. */
+    private fun startLiftOff() {
+        val bearing = awayFromHomeBearing()
+        movementJob = scope.launch {
+            var position = HOME_BASE_ORIGIN
+            while (isActive) {
+                _mockAircraft.value = buildAircraft(LIFT_OFF_GROUND_SPEED_KTS, LIFT_OFF_ALTITUDE_FT, bearing, position)
+
+                delay(LIFT_OFF_TICK_MS)
+
+                val stepMeters = knotsToMetersPerSecond(LIFT_OFF_GROUND_SPEED_KTS) * (LIFT_OFF_TICK_MS / 1_000.0)
+                position = destinationPoint(position, bearing, stepMeters)
+            }
+        }
+    }
 
     private fun startTerminalApproach() {
         val destination = target ?: return
         val initialPosition = startPosition ?: return
 
-        terminalApproachJob = scope.launch {
+        movementJob = scope.launch {
             var position = initialPosition
             while (isActive) {
                 val remaining = distanceMeters(position, destination)

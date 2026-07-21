@@ -131,7 +131,7 @@ class AirMedRadarViewModel(application: Application) : AndroidViewModel(applicat
         snapshot.map { it.isSearching }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), false)
 
     /** Whether at least one tail-locked aircraft passed the Service's trigonometric
-     *  trajectory validation gate this poll — see [AirMedTrackingService.applyTrajectoryGate]. */
+     *  trajectory validation gate this poll — see [AirMedTrackingService.evaluateTrajectoryLock]. */
     val isTargetLocked: StateFlow<Boolean> =
         snapshot.map { it.isTargetLocked }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), false)
 
