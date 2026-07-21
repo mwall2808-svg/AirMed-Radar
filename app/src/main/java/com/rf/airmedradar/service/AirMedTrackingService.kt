@@ -23,10 +23,14 @@ import com.rf.airmedradar.data.LocationRepository
 import com.rf.airmedradar.data.NetworkUtils
 import com.rf.airmedradar.data.discoverHemsProviders
 import com.rf.airmedradar.data.isRotorcraft
+import com.rf.airmedradar.util.HEMS_LOG_TAG
+import com.rf.airmedradar.util.TRAJECTORY_WINDOW_DEGREES
+import com.rf.airmedradar.util.angularDifferenceDegrees
 import com.rf.airmedradar.util.distanceMeters
 import com.rf.airmedradar.util.formatEtaSeconds
 import com.rf.airmedradar.util.initialBearingDegrees
 import com.rf.airmedradar.util.isOnTrajectoryToTarget
+import com.rf.airmedradar.util.knotsToMetersPerSecond
 import com.rf.airmedradar.util.remainingSeconds
 import java.io.IOException
 import java.net.SocketTimeoutException
@@ -382,7 +386,11 @@ class AirMedTrackingService : Service() {
     private fun evaluateTrajectoryLock(candidates: List<Aircraft>): List<Aircraft> {
         val target = _targetCoordinate.value
         if (target == null) {
+            val previousLock = _isTargetLocked.value
             _isTargetLocked.value = false
+            if (previousLock) {
+                Log.d(HEMS_LOG_TAG, "[TARGET_LOCK] isTargetLocked: true -> false (no active LZ target)")
+            }
             return emptyList()
         }
         val validated = candidates.filter { ac ->
@@ -390,9 +398,22 @@ class AirMedTrackingService : Service() {
             val lon = ac.lon ?: return@filter false
             val track = ac.track ?: return@filter false
             val bearingToTarget = initialBearingDegrees(LatLng(lat, lon), target)
-            isOnTrajectoryToTarget(aircraftTrackDegrees = track, bearingToTargetDegrees = bearingToTarget)
+            val deltaTheta = angularDifferenceDegrees(track, bearingToTarget)
+            val passed = isOnTrajectoryToTarget(aircraftTrackDegrees = track, bearingToTargetDegrees = bearingToTarget)
+            Log.d(
+                HEMS_LOG_TAG,
+                "[TRAJECTORY_GATE] icao=${ac.icao} track=%.2f° bearingToLZ=%.2f° deltaTheta=%.2f° threshold=%.1f° result=%s"
+                    .format(track, bearingToTarget, deltaTheta, TRAJECTORY_WINDOW_DEGREES, if (passed) "PASS" else "FAIL"),
+            )
+            passed
         }
+        val previousLock = _isTargetLocked.value
         _isTargetLocked.value = validated.isNotEmpty()
+        Log.d(
+            HEMS_LOG_TAG,
+            "[TARGET_LOCK] isTargetLocked: $previousLock -> ${_isTargetLocked.value} " +
+                "(validated=${validated.size}/${candidates.size} candidates)",
+        )
         return validated
     }
 
@@ -409,7 +430,16 @@ class AirMedTrackingService : Service() {
         val aircraft = lockedAircraft.firstOrNull() ?: return null
         val position = aircraft.currentCoordinates ?: return null
         val groundSpeedKnots = aircraft.groundSpeedKts ?: return null
-        return remainingSeconds(distanceMeters(position, target), groundSpeedKnots)
+
+        val distance = distanceMeters(position, target)
+        val speedMetersPerSecond = knotsToMetersPerSecond(groundSpeedKnots)
+        val etaSeconds = remainingSeconds(distance, groundSpeedKnots)
+        Log.d(
+            HEMS_LOG_TAG,
+            "[ETA_CALC] icao=${aircraft.icao} distance=%.1fm (%.2fkm) groundspeed=%.1fkt (%.2fm/s) rawEtaSeconds=%s formatted=%s"
+                .format(distance, distance / 1000.0, groundSpeedKnots, speedMetersPerSecond, etaSeconds, formatEtaSeconds(etaSeconds ?: -1L)),
+        )
+        return etaSeconds
     }
 
     /**

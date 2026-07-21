@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
 import android.os.IBinder
+import android.util.Log
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -27,6 +28,7 @@ import com.rf.airmedradar.debug.SimulationStage
 import com.rf.airmedradar.service.AirMedTrackingService
 import com.rf.airmedradar.service.InterceptStatus
 import com.rf.airmedradar.service.TrackingSnapshot
+import com.rf.airmedradar.util.HEMS_LOG_TAG
 import com.rf.airmedradar.weather.WeatherMinimumsEvaluation
 import com.rf.airmedradar.weather.evaluateFlightStatus
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -194,13 +196,25 @@ class AirMedRadarViewModel(application: Application) : AndroidViewModel(applicat
             // Keeps the simulator's synthetic aircraft orbiting/approaching whichever LZ is
             // actually active, rather than a stale coordinate from a previous dispatch.
             viewModelScope.launch {
-                targetCoordinate.collectLatest { controller.updateTarget(it) }
+                targetCoordinate.collectLatest { newTarget ->
+                    Log.d(
+                        HEMS_LOG_TAG,
+                        "[VM_TARGET] LZ target pushed to simulator: " +
+                            (newTarget?.let { "lat=%.6f lon=%.6f".format(it.latitude, it.longitude) } ?: "null (cleared)"),
+                    )
+                    controller.updateTarget(newTarget)
+                }
             }
             // Every position/state tick the controller produces is pushed into the Service's
             // real pipeline as a lightweight local reprocess (no network call) — see
             // AirMedTrackingService.updateMockAircraftLocally.
             viewModelScope.launch {
                 controller.mockAircraft.collectLatest { aircraft ->
+                    Log.d(
+                        HEMS_LOG_TAG,
+                        "[VM_FORWARD] pushing mock aircraft tick to service: " +
+                            (aircraft?.let { "icao=${it.icao} lat=${it.lat} lon=${it.lon}" } ?: "null (COLD_AND_DARK)"),
+                    )
                     _boundService.value?.updateMockAircraftLocally(aircraft)
                 }
             }
@@ -210,6 +224,7 @@ class AirMedRadarViewModel(application: Application) : AndroidViewModel(applicat
     /** Debug panel button tap: advances the simulator and forces one immediate full poll so
      *  the map/ETA card update right away instead of lagging behind the normal 12s cadence. */
     fun advanceMockSimulation(stage: SimulationStage) {
+        Log.d(HEMS_LOG_TAG, "[VM_SIM_REQUEST] debug panel requested stage: $stage")
         mockHemsController?.advanceTo(stage)
         _boundService.value?.triggerImmediateRefresh()
     }

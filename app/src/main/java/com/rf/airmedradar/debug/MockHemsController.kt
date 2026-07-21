@@ -1,7 +1,9 @@
 package com.rf.airmedradar.debug
 
+import android.util.Log
 import com.google.android.gms.maps.model.LatLng
 import com.rf.airmedradar.data.Aircraft
+import com.rf.airmedradar.util.HEMS_LOG_TAG
 import com.rf.airmedradar.util.destinationPoint
 import com.rf.airmedradar.util.distanceMeters
 import com.rf.airmedradar.util.initialBearingDegrees
@@ -110,8 +112,13 @@ class MockHemsController(private val scope: CoroutineScope) {
     }
 
     fun advanceTo(newStage: SimulationStage) {
+        val oldStage = _stage.value
         movementJob?.cancel()
         _stage.value = newStage
+        Log.d(
+            HEMS_LOG_TAG,
+            "[SIM_STATE] transition: [${oldStage.name}] ${oldStage.label} -> [${newStage.name}] ${newStage.label}",
+        )
         when (newStage) {
             // STATE 0: completely shut down — the telemetry stream has no entry at all for
             // this tail number, not a zeroed-out one. Resets the position too: the next
@@ -228,7 +235,10 @@ class MockHemsController(private val scope: CoroutineScope) {
     /** The single point where the simulator's position of record ([currentPosition]) is
      *  written — every stage, static or animated, reports its position through here, which is
      *  what makes cross-stage continuity automatic rather than something each call site has to
-     *  remember to preserve. */
+     *  remember to preserve. Also the single point where every emitted coordinate is logged, so
+     *  a continuity break (a jump between consecutive [HEMS_LOG_TAG] SIM_TICK lines bigger than
+     *  what [groundSpeedKts] over one tick interval could cover) is visible directly in Logcat
+     *  without cross-referencing multiple call sites. */
     private fun buildAircraft(
         groundSpeedKts: Double,
         altitudeFeet: Int,
@@ -236,6 +246,11 @@ class MockHemsController(private val scope: CoroutineScope) {
         position: LatLng,
     ): Aircraft {
         currentPosition = position
+        Log.d(
+            HEMS_LOG_TAG,
+            "[SIM_TICK][${_stage.value.name}] lat=%.6f lon=%.6f track=%.2f° gs=%.1fkt alt=%dft simSpeedMultiplier=%.1fx"
+                .format(position.latitude, position.longitude, trackDegrees, groundSpeedKts, altitudeFeet, _simSpeedMultiplier.value),
+        )
         return Aircraft(
             icao = MOCK_ICAO,
             callsign = MOCK_CALLSIGN,
