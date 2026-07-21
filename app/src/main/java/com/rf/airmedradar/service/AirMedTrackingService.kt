@@ -32,29 +32,36 @@ import com.rf.airmedradar.util.initialBearingDegrees
 import com.rf.airmedradar.util.isOnTrajectoryToTarget
 import com.rf.airmedradar.util.knotsToMetersPerSecond
 import com.rf.airmedradar.util.remainingSeconds
+import io.ktor.client.plugins.ClientRequestException
+import io.ktor.http.HttpStatusCode
 import java.io.IOException
 import java.net.SocketTimeoutException
 import java.net.UnknownHostException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 /**
- * Owns the telemetry engine independent of any Activity/ViewModel lifecycle: real ADS-B
- * polling, per-aircraft position-history tracking, LZ proximity alerting, and the persistent
- * tracking notification. Started in the foreground so the system doesn't throttle the polling
- * loop during long shifts, and bound by [com.rf.airmedradar.viewmodel.AirMedRadarViewModel] so
- * the UI can observe [snapshot] whenever the app is in the foreground.
+ * Owns the telemetry engine independent of any Activity lifecycle, but not independent of
+ * whether there's a mission worth tracking — see [isMissionActive]. Real ADS-B polling,
+ * per-aircraft position-history tracking, LZ proximity alerting, and the persistent tracking
+ * notification only actually run while a target is set or already locked; promoted to the
+ * foreground for exactly that window so the system doesn't throttle the polling loop during a
+ * long shift, and demoted back out — zero polling, zero GPS, zero notification — the instant
+ * neither holds. Bound by [com.rf.airmedradar.viewmodel.AirMedRadarViewModel] so the UI can
+ * observe [snapshot] whenever the app is in the foreground.
  *
  * Every aircraft in [snapshot] reflects verified incoming adsb.lol telemetry only — there is
  * no simulated/synthetic traffic in this engine.
@@ -95,7 +102,7 @@ class AirMedTrackingService : Service() {
     /** The most recent real fetch, cached so the simulator's frequent position ticks during
      *  TERMINAL_APPROACH can re-run the filter/gate pipeline (see [processBatch]) without
      *  re-hitting the network every couple of seconds — only [refreshAircraft] itself, on its
-     *  normal 12s cadence or an explicit [triggerImmediateRefresh], actually calls the API. */
+     *  normal 3s cadence or an explicit [triggerImmediateRefresh], actually calls the API. */
     private var lastFetchedBatch: List<Aircraft> = emptyList()
 
     private val telemetrySnapshot: StateFlow<TrackingSnapshot> = combine(
@@ -149,6 +156,19 @@ class AirMedTrackingService : Service() {
     }.stateIn(serviceScope, SharingStarted.Eagerly, TrackingSnapshot())
 
     /**
+     * The "Happy Medium" telemetry pipeline's master switch: true the moment there's anything
+     * worth spending battery on — a dispatched LZ, or an already-locked target (kept true through
+     * a locked target's brief unlock blips so the poll loop doesn't thrash off and back on every
+     * time a trajectory check misses one tick). False the instant neither holds, which is what
+     * [startMissionLifecycleManager] treats as "go all the way back to zero background cost."
+     */
+    private val isMissionActive: StateFlow<Boolean> = combine(
+        _targetCoordinate,
+        _isTargetLocked,
+    ) { target, locked -> target != null || locked }
+        .stateIn(serviceScope, SharingStarted.Eagerly, false)
+
+    /**
      * Running position trail per aircraft (icao -> immutable point list), used to attach
      * [Aircraft.historyPoints] on each poll. Internal bookkeeping only — never published
      * directly; every list handed to the UI via [_liveAircraft] is a freshly built copy so
@@ -165,11 +185,31 @@ class AirMedTrackingService : Service() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannels()
-        startForeground(TRACKING_NOTIFICATION_ID, buildTrackingNotification())
-        startPollingLoop()
+        resetForFreshLock()
+        startMissionLifecycleManager()
     }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
+    /** Idle services get killed the moment nothing is bound and nothing is tracked — see
+     *  [isMissionActive] — so there's deliberately no reason to ask the OS to keep an empty,
+     *  idle instance around. START_STICKY would fight that by having the OS relaunch this
+     *  service after it's reclaimed even with no mission to resume. */
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_NOT_STICKY
+
+    /**
+     * The task (this app's Recents entry) was swiped away. A locked/dispatched mission is
+     * exactly the case a foreground service exists to survive — see [isMissionActive] — so it
+     * deliberately keeps running there. With nothing active, though, there's nothing left to
+     * monitor in the background; this is a service-side backstop (independent of
+     * [com.rf.airmedradar.viewmodel.AirMedRadarViewModel]'s own Activity-lifecycle unbind)
+     * against an idle instance lingering.
+     */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        super.onTaskRemoved(rootIntent)
+        if (!isMissionActive.value) {
+            Log.d(HEMS_LOG_TAG, "[MISSION] onTaskRemoved with no active mission — stopping service")
+            stopSelf()
+        }
+    }
 
     override fun onDestroy() {
         serviceJob.cancel()
@@ -189,6 +229,14 @@ class AirMedTrackingService : Service() {
         }
     }
 
+    /**
+     * Clearing the target always drops [isMissionActive] to false (this plus
+     * [clearActiveWatchList] zero out both signals that keep it true) — so this deliberately
+     * does *not* refresh the tracking notification itself the way it used to when the service
+     * was always in the foreground. [startMissionLifecycleManager] reacts to that transition
+     * and calls `demoteFromForeground()`, which cancels it; re-posting it here would race that
+     * cancellation and could leave it stuck on screen for an idle session.
+     */
     fun clearTarget() {
         _targetCoordinate.value = null
         _interceptStatus.value = null
@@ -196,7 +244,6 @@ class AirMedTrackingService : Service() {
         hasFiredInboundAlert = false
         previousTargetDistanceNm.clear()
         clearActiveWatchList()
-        postNotificationSafely(TRACKING_NOTIFICATION_ID, buildTrackingNotification())
     }
 
     /**
@@ -220,44 +267,87 @@ class AirMedTrackingService : Service() {
         _etaSeconds.value = null
     }
 
-    /** Non-null once the recurring poll ticker has been started for this session — see
-     *  [startPollingLoop]. Its null-ness, not the location itself, is what distinguishes "a
-     *  genuine fresh lock" from "routine GPS refinement while already tracking." */
-    private var pollTicker: Job? = null
-
     /**
-     * Bootstraps entirely off the device's own GPS fix rather than any fixed/dispatcher-picked
-     * region: [LocationRepository.observeLocation] supplies a cached fix immediately (never a
-     * bogus (0,0) placeholder) and live high-accuracy updates thereafter. The *first* fix this
-     * Service ever sees is a genuine fresh lock — it clears any state left behind by a previous
-     * run and starts the recurring poll ticker. Every fix after that just updates
-     * [_deviceLocation] in place for the ticker to read on its next cycle: ordinary GPS
-     * refinement while already tracking must not keep re-clearing the map every ~30s.
+     * The "Happy Medium" telemetry pipeline's engine: reacts to [isMissionActive] flipping and
+     * does nothing else the rest of the time. [collectLatest] is exactly the right primitive
+     * here — a new value automatically cancels whatever the *previous* value's branch was doing
+     * (structured concurrency via the nested [coroutineScope]), so there's no manual job
+     * bookkeeping for "cancel the old poll loop before starting a new one."
+     *
+     * ACTIVE: promotes to a foreground service (persistent notification, survives the app being
+     * backgrounded) and runs GPS observation + the 3-second ADS-B poll ticker as sibling
+     * children of one [coroutineScope] — cancelling that scope (the instant [isMissionActive]
+     * goes false) tears down both at once, including unregistering the location callback (see
+     * [LocationRepository.observeLocation]'s `awaitClose`).
+     *
+     * IDLE: demotes out of the foreground state and dismisses every notification. No coroutines
+     * are launched in this branch — nothing is left running that costs battery: no polling, no
+     * GPS, not even a wakeup timer.
      */
-    private fun startPollingLoop() {
+    private fun startMissionLifecycleManager() {
         serviceScope.launch {
-            locationRepository.observeLocation().collect { location ->
-                _deviceLocation.value = LatLng(location.latitude, location.longitude)
-                if (pollTicker == null) {
-                    resetForFreshLock()
-                    pollTicker = serviceScope.launch {
-                        while (isActive) {
-                            _deviceLocation.value?.let { center ->
-                                refreshAircraft(center)
-                                tick()
-                            }
-                            delay(POLL_INTERVAL_MS)
-                        }
+            isMissionActive.collectLatest { active ->
+                if (active) {
+                    Log.d(HEMS_LOG_TAG, "[MISSION] active -> promoting to foreground, starting 3s poll + GPS")
+                    promoteToForeground()
+                    coroutineScope {
+                        launch { observeDeviceLocation() }
+                        launch { runPollingLoop() }
                     }
+                } else {
+                    Log.d(HEMS_LOG_TAG, "[MISSION] idle -> demoting from foreground, all polling/GPS stopped")
+                    demoteFromForeground()
                 }
             }
         }
     }
 
+    /** Emits into [_deviceLocation] for as long as this coroutine is alive — cancelled the
+     *  instant the mission goes idle, which is what actually unregisters the location callback
+     *  (see [LocationRepository.observeLocation]). */
+    private suspend fun observeDeviceLocation() {
+        locationRepository.observeLocation().collect { location ->
+            _deviceLocation.value = LatLng(location.latitude, location.longitude)
+        }
+    }
+
+    /** The 3-second ADS-B poll ticker — real network truth every [POLL_INTERVAL_MS], with
+     *  [com.rf.airmedradar.MainActivity]'s marker interpolation gliding the icon smoothly
+     *  between ticks rather than the map hopping once per fetch. */
+    private suspend fun runPollingLoop() {
+        while (currentCoroutineContext().isActive) {
+            _deviceLocation.value?.let { center ->
+                refreshAircraft(center)
+                tick()
+            }
+            delay(POLL_INTERVAL_MS)
+        }
+    }
+
+    private fun promoteToForeground() {
+        startForeground(TRACKING_NOTIFICATION_ID, buildTrackingNotification())
+    }
+
+    /** Drops out of the foreground state and clears every notification this service owns — the
+     *  ongoing tracking one and any still-visible alert — so an idle app leaves nothing behind
+     *  in the shade, matching the zero ongoing background work behind it. */
+    private fun demoteFromForeground() {
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        NotificationManagerCompat.from(this).cancel(TRACKING_NOTIFICATION_ID)
+        NotificationManagerCompat.from(this).cancel(ALERT_NOTIFICATION_ID)
+    }
+
     /**
-     * Clears every piece of state that would otherwise leak from a previous session: stale
+     * Clears every piece of state that would otherwise leak from a previous run: stale
      * aircraft/flight-path lines, position trails, the active search target/intercept status,
-     * and alert edge-triggers — run exactly once, the moment a fresh GPS lock is established.
+     * and alert edge-triggers. Called exactly once, synchronously from [onCreate] — deliberately
+     * *not* gated on the first GPS fix the way it used to be: since [observeDeviceLocation] now
+     * only ever runs once a mission is already active (see [startMissionLifecycleManager]), a
+     * "first fix" trigger would fire *after* the mission's own target had just been set,
+     * immediately wiping it back out and flipping [isMissionActive] straight back to false. None
+     * of what this actually clears needs a location fix in the first place — it's all in-memory
+     * bookkeeping that's already at these same defaults on a freshly constructed instance — so
+     * there's no reason to wait for one.
      */
     private fun resetForFreshLock() {
         aircraftHistory.clear()
@@ -297,6 +387,20 @@ class AirMedTrackingService : Service() {
         } catch (e: SocketTimeoutException) {
             Log.w(TAG, "adsb.lol request timed out — retaining last known positions", e)
             _isOffline.value = true
+        } catch (e: ClientRequestException) {
+            _isOffline.value = true
+            if (e.response.status == HttpStatusCode.TooManyRequests) {
+                // adsb.lol is a free, unauthenticated, rate-limited public API — polling it
+                // every 3s (see POLL_INTERVAL_MS) can outrun its limit under sustained use. An
+                // extra cooldown here, on top of the normal 3s cadence, means this backs off
+                // instead of hammering an endpoint that's already telling us to slow down —
+                // both the considerate thing to do to a free service and the actual behavior
+                // that gets telemetry flowing again soonest instead of retrying into more 429s.
+                Log.w(TAG, "adsb.lol rate-limited this device (429) — backing off ${RATE_LIMIT_BACKOFF_MS}ms extra")
+                delay(RATE_LIMIT_BACKOFF_MS)
+            } else {
+                Log.w(TAG, "adsb.lol rejected the request (${e.response.status}) — retaining last known positions", e)
+            }
         } catch (e: IOException) {
             Log.w(TAG, "adsb.lol network I/O failure — retaining last known positions", e)
             _isOffline.value = true
@@ -360,7 +464,7 @@ class AirMedTrackingService : Service() {
     /**
      * Debug-only: forces one full real poll (network fetch included) right now instead of
      * waiting for the next scheduled tick, so a simulator stage change reads as instant rather
-     * than lagging behind the normal 12s cadence.
+     * than lagging behind the normal 3s cadence.
      */
     fun triggerImmediateRefresh() {
         serviceScope.launch {
@@ -630,13 +734,23 @@ class AirMedTrackingService : Service() {
         private const val OPEN_APP_REQUEST_CODE = 2001
 
         private const val TRACKING_RADIUS_NM = 75
-        private const val POLL_INTERVAL_MS = 12_000L
+
+        /** The "Happy Medium" telemetry cadence — fresh network truth every 3s while a mission
+         *  is active (see [isMissionActive]); [com.rf.airmedradar.MainActivity]'s marker
+         *  interpolation covers the gap between ticks so the map still reads as smooth motion. */
+        private const val POLL_INTERVAL_MS = 3_000L
+
+        /** Extra cooldown applied only on top of [POLL_INTERVAL_MS] when adsb.lol responds
+         *  429 — see [refreshAircraft]. adsb.lol is free and unauthenticated with no published
+         *  per-IP rate limit; this value is a conservative guess, not a documented number. */
+        private const val RATE_LIMIT_BACKOFF_MS = 15_000L
+
         private const val METERS_PER_NAUTICAL_MILE = 1852.0
         private const val LANDING_THRESHOLD_NM = 0.3
         private const val INBOUND_ALERT_THRESHOLD_NM = 5.0
         private const val UNKNOWN_ETA_SECONDS = -1L
 
-        /** Trail cap per aircraft (~10 min of history at the 12s poll interval). */
-        private const val MAX_TRAIL_POINTS = 50
+        /** Trail cap per aircraft — sized to hold ~10 min of history at the 3s poll interval. */
+        private const val MAX_TRAIL_POINTS = 200
     }
 }

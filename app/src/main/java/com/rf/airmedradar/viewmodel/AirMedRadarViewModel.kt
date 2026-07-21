@@ -7,7 +7,6 @@ import android.content.Intent
 import android.content.ServiceConnection
 import android.os.IBinder
 import android.util.Log
-import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.google.android.gms.maps.model.LatLng
@@ -39,6 +38,7 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filterNotNull
@@ -53,14 +53,30 @@ private const val WEATHER_POLL_INTERVAL_MS = 15 * 60 * 1_000L
 private val FALLBACK_OPERATIONAL_CENTER = LatLng(39.0, -84.9)
 
 /**
- * Thin UI-facing façade over [AirMedTrackingService]: starts the always-running telemetry
- * engine, binds to it, and republishes its state as [StateFlow]s for Compose. Also owns
- * purely UI-local state — marker selection and notification re-entry focus requests — that
- * has no business living in the background engine.
+ * Thin UI-facing façade over [AirMedTrackingService]: binds to the telemetry engine and
+ * republishes its state as [StateFlow]s for Compose. Also owns purely UI-local state — marker
+ * selection and notification re-entry focus requests — that has no business living in the
+ * background engine.
+ *
+ * Deliberately does *not* call `startForegroundService` here — that imposes a hard few-second
+ * deadline for the service to call `startForeground()`, which only actually happens once a
+ * mission goes active (see [AirMedTrackingService.isMissionActive]/`promoteToForeground`), not
+ * on every app launch. A plain [Context.bindService] is enough to create the service, and the
+ * service's own `startForeground()` call is what keeps it alive independent of this binding
+ * once a mission starts — see [onAppBackgrounded] for the idle-side counterpart.
  */
 class AirMedRadarViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _boundService = MutableStateFlow<AirMedTrackingService?>(null)
+
+    /** Whether [bindService] has been called without a matching [unbindService] yet.
+     *  Deliberately not inferred from `_boundService.value != null` — that only reflects
+     *  "is *connected*" (set asynchronously by [ServiceConnection.onServiceConnected]), and
+     *  [MainActivity.onStart] fires essentially immediately after this ViewModel's [init] block
+     *  on a cold launch, well before that callback lands. Guarding on the connected state alone
+     *  raced a second, redundant `bindService()` call with the same [connection] every app
+     *  launch; this flag reflects "did we ask to bind," which is synchronous and race-free. */
+    private var isServiceBound = false
 
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
@@ -73,10 +89,15 @@ class AirMedRadarViewModel(application: Application) : AndroidViewModel(applicat
     }
 
     init {
+        bindTrackingService()
+    }
+
+    private fun bindTrackingService() {
+        if (isServiceBound) return
         val context = getApplication<Application>()
         val serviceIntent = Intent(context, AirMedTrackingService::class.java)
-        ContextCompat.startForegroundService(context, serviceIntent)
         context.bindService(serviceIntent, connection, Context.BIND_AUTO_CREATE)
+        isServiceBound = true
     }
 
     @OptIn(ExperimentalCoroutinesApi::class)
@@ -141,6 +162,56 @@ class AirMedRadarViewModel(application: Application) : AndroidViewModel(applicat
      *  [AirMedTrackingService.computeLockedTargetEta]. Null whenever [isTargetLocked] is false. */
     val etaSeconds: StateFlow<Long?> =
         snapshot.map { it.etaSeconds }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
+
+    /**
+     * Mirrors [AirMedTrackingService.isMissionActive] at the UI layer — used by
+     * [onAppBackgrounded], which reads [isMissionActive]`.value` as a one-off synchronous
+     * snapshot rather than collecting it, from a lifecycle callback with no Composable in
+     * sight. Deliberately [SharingStarted.Eagerly], *not* the `WhileSubscribed(5_000)` every
+     * other UI-facing flow in this class uses: a `WhileSubscribed` flow only recomputes while
+     * something is actively collecting it, and nothing here ever does — reading `.value` once
+     * doesn't count. Left as `WhileSubscribed`, this stays frozen at its initial `false` seed
+     * forever, and [onAppBackgrounded] tears the service down under an active mission every
+     * time. `Eagerly` collects [targetCoordinate]/[isTargetLocked] continuously from ViewModel
+     * construction on, which also transitively keeps *them* warm regardless of whatever the UI
+     * happens to be subscribed to at that moment.
+     */
+    val isMissionActive: StateFlow<Boolean> = combine(
+        targetCoordinate,
+        isTargetLocked,
+    ) { target, locked -> target != null || locked }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, false)
+
+    /**
+     * Activity went to ON_STOP (see [com.rf.airmedradar.MainActivity]'s lifecycle override) —
+     * deliberately not ON_PAUSE, which also fires for a transient system overlay (a permission
+     * dialog, an incoming call) sitting on top of an otherwise-foreground app; killing
+     * GPS/polling there would be a visible regression, not a battery win. With [isMissionActive]
+     * false, there is nothing left to track, so this fully releases the service — unbinds *and*
+     * explicitly stops it — rather than just letting it idle, so it costs the app exactly 0%
+     * battery while backgrounded. With a mission active, this is a deliberate no-op: that's
+     * exactly the case [AirMedTrackingService]'s own foreground promotion exists to survive.
+     */
+    fun onAppBackgrounded() {
+        if (isMissionActive.value) {
+            Log.d(HEMS_LOG_TAG, "[LIFECYCLE] app backgrounded with an active mission — service continues in foreground")
+            return
+        }
+        Log.d(HEMS_LOG_TAG, "[LIFECYCLE] app backgrounded with no active mission — unbinding and stopping service")
+        val context = getApplication<Application>()
+        if (isServiceBound) {
+            runCatching { context.unbindService(connection) }
+            isServiceBound = false
+        }
+        context.stopService(Intent(context, AirMedTrackingService::class.java))
+        _boundService.value = null
+    }
+
+    /** Activity returned to ON_START. [bindTrackingService] itself is idempotent — this simply
+     *  re-asks; a mission that stayed active never unbound in the first place. */
+    fun onAppForegrounded() {
+        bindTrackingService()
+    }
 
     /** The dispatched provider's display name, for the tactical lock overlay ("UC Air Care
      *  Inbound"). Purely a UI label — the Service only needs [HemsProviderEntity.tailNumbers]

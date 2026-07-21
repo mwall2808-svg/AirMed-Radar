@@ -114,7 +114,9 @@ import com.rf.airmedradar.debug.SimulationStage
 import com.rf.airmedradar.service.AirMedTrackingService
 import com.rf.airmedradar.service.InterceptStatus
 import com.rf.airmedradar.ui.theme.AirMedRadarTheme
+import com.rf.airmedradar.util.destinationPoint
 import com.rf.airmedradar.util.formatEtaSeconds
+import com.rf.airmedradar.util.knotsToMetersPerSecond
 import com.rf.airmedradar.viewmodel.AirMedRadarViewModel
 import com.rf.airmedradar.weather.FlightStatus
 import com.rf.airmedradar.weather.WeatherMinimumsEvaluation
@@ -148,6 +150,18 @@ class MainActivity : ComponentActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         handleIntent(intent)
+    }
+
+    /** ON_STOP, not ON_START-paired ON_PAUSE — see [AirMedRadarViewModel.onAppBackgrounded]'s
+     *  KDoc for why the earlier, more trigger-happy callback would be wrong here. */
+    override fun onStop() {
+        super.onStop()
+        viewModel.onAppBackgrounded()
+    }
+
+    override fun onStart() {
+        super.onStart()
+        viewModel.onAppForegrounded()
     }
 
     private fun handleIntent(intent: Intent?) {
@@ -848,9 +862,48 @@ private val AIRCRAFT_ICON_COLOR = Color(0xFF2979FF) // azure
 private val AIRCRAFT_ICON_COLOR_SELECTED = Color(0xFFFFD600) // yellow
 private val AIRCRAFT_ICON_SIZE = 40.dp
 
+/** ~30fps — smooth enough for a map marker glide, cheap enough to run per-aircraft indefinitely. */
+private const val INTERPOLATION_TICK_MS = 33L
+
+/**
+ * The "Happy Medium" telemetry pipeline's client-side half: [AirMedTrackingService] only hands
+ * down a genuinely fresh position once every 3 seconds (see `POLL_INTERVAL_MS`), so rendering
+ * [aircraft]'s raw [Aircraft.currentCoordinates] directly would make the marker visibly hop
+ * once per poll instead of flying. This dead-reckons the gap: the instant a new authoritative
+ * fix lands, it re-anchors here and glides forward along the aircraft's own reported `track`
+ * bearing at its own reported `groundSpeedKts`, ticking every [INTERPOLATION_TICK_MS] — until
+ * the *next* fix lands and the same thing happens again, so any accumulated dead-reckoning
+ * drift never lasts longer than one poll interval.
+ *
+ * Keyed on the aircraft's actual telemetry fields, not the whole [Aircraft] object — a
+ * same-valued re-poll (e.g. a stationary aircraft on the ramp) must not restart the glide loop
+ * and briefly stutter it back to its anchor for no visible reason.
+ */
+@Composable
+private fun rememberInterpolatedPosition(aircraft: Aircraft): LatLng? {
+    val anchorPosition = aircraft.currentCoordinates ?: return null
+    val trackDegrees = aircraft.track ?: 0.0
+    val groundSpeedKts = aircraft.groundSpeedKts ?: 0.0
+
+    var displayedPosition by remember(aircraft.icao) { mutableStateOf(anchorPosition) }
+
+    LaunchedEffect(aircraft.icao, anchorPosition.latitude, anchorPosition.longitude, trackDegrees, groundSpeedKts) {
+        displayedPosition = anchorPosition
+        val speedMetersPerSecond = knotsToMetersPerSecond(groundSpeedKts)
+        if (speedMetersPerSecond <= 0.0) return@LaunchedEffect // parked — nothing to glide toward
+        val anchorTimeMs = System.currentTimeMillis()
+        while (isActive) {
+            delay(INTERPOLATION_TICK_MS)
+            val elapsedSeconds = (System.currentTimeMillis() - anchorTimeMs) / 1_000.0
+            displayedPosition = destinationPoint(anchorPosition, trackDegrees, speedMetersPerSecond * elapsedSeconds)
+        }
+    }
+    return displayedPosition
+}
+
 @Composable
 private fun AircraftMarker(aircraft: Aircraft, isSelected: Boolean, onClick: () -> Unit) {
-    val position = aircraft.currentCoordinates ?: return
+    val position = rememberInterpolatedPosition(aircraft) ?: return
     val markerState = rememberUpdatedMarkerState(position = position)
 
     val altitudeLabel = aircraft.altitudeFeet?.let { "$it ft" } ?: "Alt N/A"
@@ -940,7 +993,9 @@ private fun AircraftHistoryTrail(aircraft: Aircraft) {
  */
 @Composable
 private fun DestinationProjectionLine(aircraft: Aircraft, target: LatLng) {
-    val current = aircraft.currentCoordinates ?: return
+    // Anchored to the same interpolated position AircraftMarker renders — using the raw 3s-old
+    // fix here instead would visibly detach the line's start point from the glide-animated icon.
+    val current = rememberInterpolatedPosition(aircraft) ?: return
     Polyline(
         points = listOf(current, target),
         color = Color(0xFF00E5FF), // bright cyan
@@ -960,10 +1015,12 @@ private fun DestinationProjectionLine(aircraft: Aircraft, target: LatLng) {
  */
 @Composable
 private fun AircraftEtaLabel(aircraft: Aircraft, targetCoordinate: LatLng?) {
-    val position = aircraft.currentCoordinates ?: return
+    // Anchored to the same interpolated position AircraftMarker renders, so the label glides
+    // in lockstep with the icon instead of trailing behind it between polls.
+    val position = rememberInterpolatedPosition(aircraft) ?: return
 
     // Aircraft is a data class, so any position/speed/track change from the 3s sim tick or
-    // 12s network poll produces a new instance, recomposing this function with fresh text —
+    // 3s network poll produces a new instance, recomposing this function with fresh text —
     // but MarkerComposable bakes its content into a bitmap once and doesn't reliably observe
     // later content-only recompositions. Keying on the text forces the marker's composition
     // slot to be torn down and recreated whenever it changes, guaranteeing a fresh bake.
