@@ -462,9 +462,12 @@ fun RadarScreen(viewModel: AirMedRadarViewModel, modifier: Modifier = Modifier) 
                     val simController = viewModel.mockHemsController
                     if (simController != null) {
                         val simStage by simController.stage.collectAsStateWithLifecycle()
+                        val simSpeedMultiplier by simController.simSpeedMultiplier.collectAsStateWithLifecycle()
                         SimulatorDebugPanel(
                             currentStage = simStage,
                             onSelectStage = viewModel::advanceMockSimulation,
+                            currentSpeedMultiplier = simSpeedMultiplier,
+                            onSelectSpeedMultiplier = simController::setSimSpeedMultiplier,
                             modifier = Modifier
                                 .align(Alignment.BottomStart)
                                 .navigationBarsPadding()
@@ -741,15 +744,22 @@ private fun TacticalLockCard(providerName: String?, etaSeconds: Long?, modifier:
     }
 }
 
+/** The time-warp multiplier choices offered by [SimulatorDebugPanel] — real-world speed, plus
+ *  two compressed rates for watching a full UCMC-to-LZ approach without waiting it out. */
+private val SIM_SPEED_MULTIPLIERS = listOf(1.0, 5.0, 10.0)
+
 /**
  * Debug-only launch simulator control — a collapsible "SIM" chip that expands into
- * the 5 [SimulationStage] steps for the "Tab Test Medical" mock aircraft. Collapsed
- * by default so it stays out of the way of the map during ordinary debug testing.
+ * the 5 [SimulationStage] steps plus a time-warp speed toggle for the "Tab Test Medical"
+ * mock aircraft. Collapsed by default so it stays out of the way of the map during
+ * ordinary debug testing.
  */
 @Composable
 private fun SimulatorDebugPanel(
     currentStage: SimulationStage,
     onSelectStage: (SimulationStage) -> Unit,
+    currentSpeedMultiplier: Double,
+    onSelectSpeedMultiplier: (Double) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     var expanded by remember { mutableStateOf(false) }
@@ -797,6 +807,27 @@ private fun SimulatorDebugPanel(
                             Spacer(modifier = Modifier.width(6.dp))
                             Text(text = "●", color = Color(0xFF00E676), fontSize = 10.sp)
                         }
+                    }
+                }
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = "SPEED",
+                    color = Color.White.copy(alpha = 0.6f),
+                    fontSize = 10.sp,
+                )
+                Spacer(modifier = Modifier.height(2.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    SIM_SPEED_MULTIPLIERS.forEach { multiplier ->
+                        val isActive = multiplier == currentSpeedMultiplier
+                        Text(
+                            text = "${multiplier.toInt()}x",
+                            color = if (isActive) Color(0xFF00E676) else Color.White,
+                            fontWeight = if (isActive) FontWeight.Bold else FontWeight.Normal,
+                            fontSize = 12.sp,
+                            modifier = Modifier
+                                .clickable { onSelectSpeedMultiplier(multiplier) }
+                                .padding(vertical = 4.dp, horizontal = 8.dp),
+                        )
                     }
                 }
             }
