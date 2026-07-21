@@ -13,17 +13,12 @@ import com.google.android.gms.maps.model.LatLng
 import com.google.android.libraries.places.api.Places
 import com.google.android.libraries.places.api.model.AutocompletePrediction
 import com.google.android.libraries.places.api.model.AutocompleteSessionToken
-import com.rf.airmedradar.BuildConfig
 import com.rf.airmedradar.data.Aircraft
 import com.rf.airmedradar.data.DiscoveredHemsProvider
 import com.rf.airmedradar.data.PlacesAutocompleteRepository
 import com.rf.airmedradar.data.WeatherRepository
 import com.rf.airmedradar.data.fleet.HemsFleetDatabase
 import com.rf.airmedradar.data.fleet.HemsProviderEntity
-import com.rf.airmedradar.debug.MOCK_PROVIDER_NAME
-import com.rf.airmedradar.debug.MOCK_PROVIDER_TAIL_NUMBER
-import com.rf.airmedradar.debug.MockHemsController
-import com.rf.airmedradar.debug.SimulationStage
 import com.rf.airmedradar.service.AirMedTrackingService
 import com.rf.airmedradar.service.InterceptStatus
 import com.rf.airmedradar.service.TrackingSnapshot
@@ -240,64 +235,6 @@ class AirMedRadarViewModel(application: Application) : AndroidViewModel(applicat
                 HemsProviderEntity(providerName = providerName, tailNumbers = tailNumbers, isCustom = true),
             )
         }
-    }
-
-    // --- Phase 9.11 HEMS pre-flight/launch simulator: exists only in debug builds, so it never
-    // compiles into a release APK's reachable UI surface. Drives a synthetic aircraft through
-    // the real Phase 9.9 tail-lock filter and Phase 9.10 trajectory gate — see
-    // [MockHemsController] and [AirMedTrackingService.updateMockAircraftLocally] — rather than
-    // faking the outcome, so it actually exercises the pipeline being tested. ---
-
-    val mockHemsController: MockHemsController? = if (BuildConfig.DEBUG) MockHemsController(viewModelScope) else null
-
-    init {
-        mockHemsController?.let { controller ->
-            // Guarantees the simulator's bound provider always exists in the Room registry,
-            // regardless of what a prior manual test session left behind — REPLACE-on-conflict
-            // via the unique providerName index makes this idempotent across app launches.
-            viewModelScope.launch {
-                hemsProviderDao.insertProvider(
-                    HemsProviderEntity(
-                        providerName = MOCK_PROVIDER_NAME,
-                        tailNumbers = listOf(MOCK_PROVIDER_TAIL_NUMBER),
-                        isCustom = true,
-                    ),
-                )
-            }
-            // Keeps the simulator's synthetic aircraft orbiting/approaching whichever LZ is
-            // actually active, rather than a stale coordinate from a previous dispatch.
-            viewModelScope.launch {
-                targetCoordinate.collectLatest { newTarget ->
-                    Log.d(
-                        HEMS_LOG_TAG,
-                        "[VM_TARGET] LZ target pushed to simulator: " +
-                            (newTarget?.let { "lat=%.6f lon=%.6f".format(it.latitude, it.longitude) } ?: "null (cleared)"),
-                    )
-                    controller.updateTarget(newTarget)
-                }
-            }
-            // Every position/state tick the controller produces is pushed into the Service's
-            // real pipeline as a lightweight local reprocess (no network call) — see
-            // AirMedTrackingService.updateMockAircraftLocally.
-            viewModelScope.launch {
-                controller.mockAircraft.collectLatest { aircraft ->
-                    Log.d(
-                        HEMS_LOG_TAG,
-                        "[VM_FORWARD] pushing mock aircraft tick to service: " +
-                            (aircraft?.let { "icao=${it.icao} lat=${it.lat} lon=${it.lon}" } ?: "null (COLD_AND_DARK)"),
-                    )
-                    _boundService.value?.updateMockAircraftLocally(aircraft)
-                }
-            }
-        }
-    }
-
-    /** Debug panel button tap: advances the simulator and forces one immediate full poll so
-     *  the map/ETA card update right away instead of lagging behind the normal 12s cadence. */
-    fun advanceMockSimulation(stage: SimulationStage) {
-        Log.d(HEMS_LOG_TAG, "[VM_SIM_REQUEST] debug panel requested stage: $stage")
-        mockHemsController?.advanceTo(stage)
-        _boundService.value?.triggerImmediateRefresh()
     }
 
     /**

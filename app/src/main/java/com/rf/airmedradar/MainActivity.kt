@@ -32,7 +32,6 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
@@ -110,7 +109,6 @@ import com.google.android.libraries.places.api.model.AutocompletePrediction
 import com.rf.airmedradar.data.Aircraft
 import com.rf.airmedradar.data.fleet.HemsProviderEntity
 import com.rf.airmedradar.data.fleet.parseTailNumbers
-import com.rf.airmedradar.debug.SimulationStage
 import com.rf.airmedradar.service.AirMedTrackingService
 import com.rf.airmedradar.service.InterceptStatus
 import com.rf.airmedradar.ui.theme.AirMedRadarTheme
@@ -466,29 +464,6 @@ fun RadarScreen(viewModel: AirMedRadarViewModel, modifier: Modifier = Modifier) 
                 ) {
                     TacticalLockCard(providerName = dispatchedProviderName, etaSeconds = displayedEtaSeconds)
                 }
-
-                // Phase 9.11 launch simulator debug panel — only ever present in a
-                // debug build (mockHemsController is null in release), drives the
-                // "Tab Test Medical" synthetic aircraft through its 5 flight stages
-                // so the trajectory gate / tactical lock / ETA path can be exercised
-                // without a live rotorcraft in range.
-                if (BuildConfig.DEBUG) {
-                    val simController = viewModel.mockHemsController
-                    if (simController != null) {
-                        val simStage by simController.stage.collectAsStateWithLifecycle()
-                        val simSpeedMultiplier by simController.simSpeedMultiplier.collectAsStateWithLifecycle()
-                        SimulatorDebugPanel(
-                            currentStage = simStage,
-                            onSelectStage = viewModel::advanceMockSimulation,
-                            currentSpeedMultiplier = simSpeedMultiplier,
-                            onSelectSpeedMultiplier = simController::setSimSpeedMultiplier,
-                            modifier = Modifier
-                                .align(Alignment.BottomStart)
-                                .navigationBarsPadding()
-                                .padding(start = 16.dp, bottom = 96.dp),
-                        )
-                    }
-                }
             }
         }
     }
@@ -754,97 +729,6 @@ private fun TacticalLockCard(providerName: String?, etaSeconds: Long?, modifier:
                 fontWeight = FontWeight.Bold,
                 fontSize = 18.sp,
             )
-        }
-    }
-}
-
-/** The time-warp multiplier choices offered by [SimulatorDebugPanel] — real-world speed, plus
- *  two compressed rates for watching a full UCMC-to-LZ approach without waiting it out. */
-private val SIM_SPEED_MULTIPLIERS = listOf(1.0, 5.0, 10.0)
-
-/**
- * Debug-only launch simulator control — a collapsible "SIM" chip that expands into
- * the 5 [SimulationStage] steps plus a time-warp speed toggle for the "Tab Test Medical"
- * mock aircraft. Collapsed by default so it stays out of the way of the map during
- * ordinary debug testing.
- */
-@Composable
-private fun SimulatorDebugPanel(
-    currentStage: SimulationStage,
-    onSelectStage: (SimulationStage) -> Unit,
-    currentSpeedMultiplier: Double,
-    onSelectSpeedMultiplier: (Double) -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    var expanded by remember { mutableStateOf(false) }
-
-    Surface(
-        modifier = modifier,
-        color = Color.Black.copy(alpha = 0.68f),
-        shape = RoundedCornerShape(10.dp),
-    ) {
-        Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.clickable { expanded = !expanded },
-            ) {
-                Text(
-                    text = "SIM",
-                    color = Color(0xFF00E676), // bright green — tactical/HUD read
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 12.sp,
-                )
-                Spacer(modifier = Modifier.width(6.dp))
-                Text(
-                    text = if (expanded) "▾" else "▸",
-                    color = Color.White,
-                    fontSize = 12.sp,
-                )
-            }
-            if (expanded) {
-                Spacer(modifier = Modifier.height(6.dp))
-                SimulationStage.entries.forEach { stage ->
-                    val isActive = stage == currentStage
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier
-                            .clickable { onSelectStage(stage) }
-                            .padding(vertical = 4.dp),
-                    ) {
-                        Text(
-                            text = stage.label,
-                            color = if (isActive) Color(0xFF00E676) else Color.White,
-                            fontWeight = if (isActive) FontWeight.Bold else FontWeight.Normal,
-                            fontSize = 12.sp,
-                        )
-                        if (isActive) {
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text(text = "●", color = Color(0xFF00E676), fontSize = 10.sp)
-                        }
-                    }
-                }
-                Spacer(modifier = Modifier.height(8.dp))
-                Text(
-                    text = "SPEED",
-                    color = Color.White.copy(alpha = 0.6f),
-                    fontSize = 10.sp,
-                )
-                Spacer(modifier = Modifier.height(2.dp))
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    SIM_SPEED_MULTIPLIERS.forEach { multiplier ->
-                        val isActive = multiplier == currentSpeedMultiplier
-                        Text(
-                            text = "${multiplier.toInt()}x",
-                            color = if (isActive) Color(0xFF00E676) else Color.White,
-                            fontWeight = if (isActive) FontWeight.Bold else FontWeight.Normal,
-                            fontSize = 12.sp,
-                            modifier = Modifier
-                                .clickable { onSelectSpeedMultiplier(multiplier) }
-                                .padding(vertical = 4.dp, horizontal = 8.dp),
-                        )
-                    }
-                }
-            }
         }
     }
 }
