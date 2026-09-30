@@ -169,6 +169,9 @@ class AirMedTrackingService : Service() {
     /** Edge-trigger guard so the 5 NM heads-up alert fires once per inbound approach. */
     private var hasFiredInboundAlert = false
 
+    /** Consecutive failed polls, used to debounce [_isOffline] — see [refreshAircraft]. */
+    private var consecutiveFailures = 0
+
     override fun onCreate() {
         super.onCreate()
         createNotificationChannels()
@@ -365,29 +368,31 @@ class AirMedTrackingService : Service() {
      * Pulls the latest telemetry batch scoped around [center]. On any network failure,
      * last-known aircraft positions are simply left in place (`_liveAircraft` is untouched) and
      * the next scheduled tick retries cleanly — a dropped signal never crashes this service.
+     *
+     * Deliberately does *not* gate the attempt on [NetworkUtils.isOnline] first: that check
+     * requires `NET_CAPABILITY_VALIDATED`, which drops transiently on cellular during ordinary
+     * tower handoffs even while data is still flowing — pre-emptively skipping the poll on that
+     * signal alone was flipping [_isOffline] far more often than the network was actually down.
+     * Instead this always attempts the real request and lets [recordFailure]/[recordSuccess]
+     * debounce a handful of consecutive real failures before actually declaring offline.
      */
     private suspend fun refreshAircraft(center: LatLng) {
-        if (!NetworkUtils.isOnline(applicationContext)) {
-            _isOffline.value = true
-            Log.w(TAG, "Skipping poll: device reports no active network")
-            return
-        }
         try {
             val fetched = repository.fetchAircraftNear(
                 lat = center.latitude,
                 lon = center.longitude,
                 radiusNm = TRACKING_RADIUS_NM,
             )
-            _isOffline.value = false
+            recordSuccess()
             processBatch(fetched)
         } catch (e: UnknownHostException) {
             Log.w(TAG, "adsb.lol unreachable (no DNS/connectivity) — retaining last known positions", e)
-            _isOffline.value = true
+            recordFailure()
         } catch (e: SocketTimeoutException) {
             Log.w(TAG, "adsb.lol request timed out — retaining last known positions", e)
-            _isOffline.value = true
+            recordFailure()
         } catch (e: ClientRequestException) {
-            _isOffline.value = true
+            recordFailure()
             if (e.response.status == HttpStatusCode.TooManyRequests) {
                 // adsb.lol is a free, unauthenticated, rate-limited public API — polling it
                 // every 3s (see POLL_INTERVAL_MS) can outrun its limit under sustained use. An
@@ -402,11 +407,29 @@ class AirMedTrackingService : Service() {
             }
         } catch (e: IOException) {
             Log.w(TAG, "adsb.lol network I/O failure — retaining last known positions", e)
-            _isOffline.value = true
+            recordFailure()
         } catch (e: Exception) {
             // Last line of defense: an unexpected SDK/runtime exception must never take
             // down a foreground service running unattended for an entire shift.
             Log.e(TAG, "Unexpected error refreshing aircraft telemetry", e)
+            recordFailure()
+        }
+    }
+
+    /** Clears the failure streak and immediately drops the offline banner — a single good poll
+     *  is trusted right away, there's no debounce on the way back up. */
+    private fun recordSuccess() {
+        consecutiveFailures = 0
+        _isOffline.value = false
+    }
+
+    /** Only flips [_isOffline] to true after [OFFLINE_FAILURE_THRESHOLD] consecutive failed
+     *  polls (~9s at the 3s cadence) — a single dropped request during a normal cellular blip
+     *  (tower handoff, one lost packet) no longer flashes an "offline" banner that the very
+     *  next tick would immediately clear anyway. */
+    private fun recordFailure() {
+        consecutiveFailures++
+        if (consecutiveFailures >= OFFLINE_FAILURE_THRESHOLD) {
             _isOffline.value = true
         }
     }
@@ -714,6 +737,10 @@ class AirMedTrackingService : Service() {
          *  429 — see [refreshAircraft]. adsb.lol is free and unauthenticated with no published
          *  per-IP rate limit; this value is a conservative guess, not a documented number. */
         private const val RATE_LIMIT_BACKOFF_MS = 15_000L
+
+        /** Consecutive failed polls required before [_isOffline] flips true — see
+         *  [recordFailure]. */
+        private const val OFFLINE_FAILURE_THRESHOLD = 3
 
         private const val METERS_PER_NAUTICAL_MILE = 1852.0
         private const val LANDING_THRESHOLD_NM = 0.3
