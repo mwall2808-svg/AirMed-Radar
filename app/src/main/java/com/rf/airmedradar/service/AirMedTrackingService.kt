@@ -172,6 +172,10 @@ class AirMedTrackingService : Service() {
     /** Consecutive failed polls, used to debounce [_isOffline] — see [refreshAircraft]. */
     private var consecutiveFailures = 0
 
+    /** Consecutive 429s from adsb.lol, used to grow [RATE_LIMIT_BACKOFF_BASE_MS] into a real
+     *  backoff instead of repeatedly re-adding the same flat delay — see [refreshAircraft]. */
+    private var consecutiveRateLimits = 0
+
     override fun onCreate() {
         super.onCreate()
         createNotificationChannels()
@@ -394,14 +398,19 @@ class AirMedTrackingService : Service() {
         } catch (e: ClientRequestException) {
             recordFailure()
             if (e.response.status == HttpStatusCode.TooManyRequests) {
-                // adsb.lol is a free, unauthenticated, rate-limited public API — polling it
-                // every 3s (see POLL_INTERVAL_MS) can outrun its limit under sustained use. An
-                // extra cooldown here, on top of the normal 3s cadence, means this backs off
-                // instead of hammering an endpoint that's already telling us to slow down —
-                // both the considerate thing to do to a free service and the actual behavior
-                // that gets telemetry flowing again soonest instead of retrying into more 429s.
-                Log.w(TAG, "adsb.lol rate-limited this device (429) — backing off ${RATE_LIMIT_BACKOFF_MS}ms extra")
-                delay(RATE_LIMIT_BACKOFF_MS)
+                // adsb.lol is a free, unauthenticated, rate-limited public API — a flat backoff
+                // here was re-adding the exact same delay on every single 429, which in practice
+                // settled into a steady fail/success/fail/success cadence: just long enough to
+                // clear the limit once, never long enough to actually stay clear of it. Scaling
+                // the backoff with how many 429s have happened *in a row* lets this settle at
+                // whatever adsb.lol's real limit actually is instead of guessing a fixed number,
+                // and it resets the moment a poll succeeds (see [recordSuccess]) so a brief
+                // rate-limit blip doesn't leave the cadence artificially slow afterward.
+                consecutiveRateLimits++
+                val backoffMs = (RATE_LIMIT_BACKOFF_BASE_MS * consecutiveRateLimits)
+                    .coerceAtMost(RATE_LIMIT_BACKOFF_MAX_MS)
+                Log.w(TAG, "adsb.lol rate-limited this device (429, streak=$consecutiveRateLimits) — backing off ${backoffMs}ms extra")
+                delay(backoffMs)
             } else {
                 Log.w(TAG, "adsb.lol rejected the request (${e.response.status}) — retaining last known positions", e)
             }
@@ -420,11 +429,12 @@ class AirMedTrackingService : Service() {
      *  is trusted right away, there's no debounce on the way back up. */
     private fun recordSuccess() {
         consecutiveFailures = 0
+        consecutiveRateLimits = 0
         _isOffline.value = false
     }
 
     /** Only flips [_isOffline] to true after [OFFLINE_FAILURE_THRESHOLD] consecutive failed
-     *  polls (~9s at the 3s cadence) — a single dropped request during a normal cellular blip
+     *  polls (~15s at the 5s cadence) — a single dropped request during a normal cellular blip
      *  (tower handoff, one lost packet) no longer flashes an "offline" banner that the very
      *  next tick would immediately clear anyway. */
     private fun recordFailure() {
@@ -728,15 +738,21 @@ class AirMedTrackingService : Service() {
 
         private const val TRACKING_RADIUS_NM = 75
 
-        /** The "Happy Medium" telemetry cadence — fresh network truth every 3s while a mission
+        /** The "Happy Medium" telemetry cadence — fresh network truth every 5s while a mission
          *  is active (see [isMissionActive]); [com.rf.airmedradar.MainActivity]'s marker
-         *  interpolation covers the gap between ticks so the map still reads as smooth motion. */
-        private const val POLL_INTERVAL_MS = 3_000L
+         *  interpolation covers the gap between ticks so the map still reads as smooth motion.
+         *  Raised from 3s after a live mission showed adsb.lol 429-ing roughly every other poll
+         *  at that cadence — 5s gives its rate-limit window enough room to actually clear
+         *  instead of getting re-tripped almost immediately after every successful poll. */
+        private const val POLL_INTERVAL_MS = 5_000L
 
-        /** Extra cooldown applied only on top of [POLL_INTERVAL_MS] when adsb.lol responds
-         *  429 — see [refreshAircraft]. adsb.lol is free and unauthenticated with no published
-         *  per-IP rate limit; this value is a conservative guess, not a documented number. */
-        private const val RATE_LIMIT_BACKOFF_MS = 15_000L
+        /** Extra cooldown applied on top of [POLL_INTERVAL_MS] when adsb.lol responds 429,
+         *  multiplied by the current consecutive-429 streak and capped at
+         *  [RATE_LIMIT_BACKOFF_MAX_MS] — see [refreshAircraft]. adsb.lol is free and
+         *  unauthenticated with no published per-IP rate limit; these values are conservative
+         *  guesses, not documented numbers. */
+        private const val RATE_LIMIT_BACKOFF_BASE_MS = 10_000L
+        private const val RATE_LIMIT_BACKOFF_MAX_MS = 60_000L
 
         /** Consecutive failed polls required before [_isOffline] flips true — see
          *  [recordFailure]. */
@@ -747,7 +763,7 @@ class AirMedTrackingService : Service() {
         private const val INBOUND_ALERT_THRESHOLD_NM = 5.0
         private const val UNKNOWN_ETA_SECONDS = -1L
 
-        /** Trail cap per aircraft — sized to hold ~10 min of history at the 3s poll interval. */
+        /** Trail cap per aircraft — holds ~16 min of history at the 5s poll interval. */
         private const val MAX_TRAIL_POINTS = 200
     }
 }
